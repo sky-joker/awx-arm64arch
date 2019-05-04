@@ -1,0 +1,24 @@
+FROM centos:7
+
+RUN rpm -ivh https://dl.fedoraproject.org/pub/epel/7/aarch64/Packages/e/epel-release-7-11.noarch.rpm
+
+RUN yum install -y bzip2 \
+    gcc-c++ \
+    gettext \
+    git \
+    make \
+    python36-setuptools
+
+RUN curl -L https://nodejs.org/dist/v8.16.0/node-v8.16.0-linux-arm64.tar.xz -O && \
+    tar Jxvf node-v8.16.0-linux-arm64.tar.xz && \
+    cd node-v8.16.0-linux-arm64 && \
+    cp -R * /usr/local/ && \
+    cd .. && \
+    rm -rf node-v8.16.0-linux-arm64*
+
+RUN npm set progress=false
+
+WORKDIR "/awx"
+
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["make sdist"]
