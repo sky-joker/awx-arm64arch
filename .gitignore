@@ -8,7 +8,7 @@ reference-schema.json
 .tags1
 
 # Tower
-#awx/settings/local_*.py*
+awx/settings/local_*.py*
 awx/*.sqlite3
 awx/*.sqlite3_*
 awx/job_status
@@ -57,7 +57,7 @@ __pycache__
 **/node_modules/**
 /tmp
 **/npm-debug.log*
-#**/package-lock.json
+**/package-lock.json
 
 # UI build flag files
 awx/ui/.deps_built
