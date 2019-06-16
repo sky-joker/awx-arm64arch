@@ -5,7 +5,6 @@ env:
 
 branches:
   except:
-    - devel
     - 4.0.0
 
 build:
