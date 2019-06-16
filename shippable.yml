@@ -1,0 +1,23 @@
+language: python
+
+env:
+  - VERSION=4.0.0
+
+branches:
+  except:
+    - devel
+    - 4.0.0
+
+build:
+  pre_ci_boot:
+    options: "-v /tmp:/tmp"
+  ci:
+    - rm -rf /tmp/awx-arm64arch
+    - apt install -y python-dev ansible gcc
+    - pip install docker-compose
+    - cd ../
+    - mv awx-arm64arch /tmp
+    - cd /tmp/awx-arm64arch
+    - git checkout -b $VERSION refs/tags/$VERSION
+    - cd installer/
+    - ansible-playbook build.yml -i inventory
