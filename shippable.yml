@@ -8,13 +8,13 @@ branches:
     - 4.0.0
 
 build:
-  pre_ci_boot:
-    options: "-v /tmp:/tmp"
-  ci:
+  pre_ci:
     - rm -rf /tmp/awx-arm64arch
     - for i in $( docker ps -a | grep awx | awk '{print $1 }' ) ; do docker rm $i ; done
     - for i in $( docker images | grep -v -e aarch64_ -e centos | grep awx | awk '{print $1,$2}' | sed -e 's/ /:/g' ) ; do docker rmi $i ; done
-    - apt install -y python-dev ansible gcc
+  pre_ci_boot:
+    options: "-v /tmp:/tmp"
+  ci:
     - apt install -y python-dev ansible gcc
     - pip install docker-compose
     - cd ../
