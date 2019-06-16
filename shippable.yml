@@ -4,8 +4,9 @@ env:
   - VERSION=4.0.0
 
 branches:
-  only:
+  except:
     - devel
+    - 4.0.0
 
 build:
   pre_ci_boot:
