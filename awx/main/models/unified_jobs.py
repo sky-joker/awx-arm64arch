@@ -20,7 +20,6 @@ from django.core.exceptions import NON_FIELD_ERRORS
 from django.utils.translation import ugettext_lazy as _
 from django.utils.timezone import now
 from django.utils.encoding import smart_text
-from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 
 # REST Framework
@@ -40,6 +39,7 @@ from awx.main.dispatch.control import Control as ControlDispatcher
 from awx.main.registrar import activity_stream_registrar
 from awx.main.models.mixins import ResourceMixin, TaskManagerUnifiedJobMixin
 from awx.main.utils import (
+    camelcase_to_underscore, get_model_for_type,
     encrypt_dict, decrypt_field, _inventory_updates,
     copy_model_by_class, copy_m2m_relationships,
     get_type_for_model, parse_yaml_or_json, getattr_dne
@@ -48,7 +48,7 @@ from awx.main.utils import polymorphic, schedule_task_manager
 from awx.main.constants import ACTIVE_STATES, CAN_CANCEL
 from awx.main.redact import UriCleaner, REPLACE_STR
 from awx.main.consumers import emit_channel_notification
-from awx.main.fields import JSONField, AskForField
+from awx.main.fields import JSONField, AskForField, OrderedManyToManyField
 
 __all__ = ['UnifiedJobTemplate', 'UnifiedJob', 'StdoutMaxBytesExceeded']
 
@@ -98,6 +98,7 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, Notificatio
 
     class Meta:
         app_label = 'main'
+        ordering = ('name',)
         # unique_together here is intentionally commented out. Please make sure sub-classes of this model
         # contain at least this uniqueness restriction: SOFT_UNIQUE_TOGETHER = [('polymorphic_ctype', 'name')]
         #unique_together = [('polymorphic_ctype', 'name')]
@@ -164,9 +165,10 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, Notificatio
         blank=True,
         related_name='%(class)s_labels'
     )
-    instance_groups = models.ManyToManyField(
+    instance_groups = OrderedManyToManyField(
         'InstanceGroup',
         blank=True,
+        through='UnifiedJobTemplateInstanceGroupMembership'
     )
 
     def get_absolute_url(self, request=None):
@@ -251,11 +253,13 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, Notificatio
         return self.last_job_run
 
     def update_computed_fields(self):
-        Schedule = self._meta.get_field('schedules').related_model
-        related_schedules = Schedule.objects.filter(enabled=True, unified_job_template=self, next_run__isnull=False).order_by('-next_run')
-        if related_schedules.exists():
-            self.next_schedule = related_schedules[0]
-            self.next_job_run = related_schedules[0].next_run
+        related_schedules = self.schedules.filter(enabled=True, next_run__isnull=False).order_by('-next_run')
+        new_next_schedule = related_schedules.first()
+        if new_next_schedule:
+            if new_next_schedule.pk == self.next_schedule_id and new_next_schedule.next_run == self.next_job_run:
+                return  # no-op, common for infrequent schedules
+            self.next_schedule = new_next_schedule
+            self.next_job_run = new_next_schedule.next_run
             self.save(update_fields=['next_schedule', 'next_job_run'])
 
     def save(self, *args, **kwargs):
@@ -484,33 +488,14 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, Notificatio
 
 class UnifiedJobTypeStringMixin(object):
     @classmethod
-    def _underscore_to_camel(cls, word):
-        return ''.join(x.capitalize() or '_' for x in word.split('_'))
-
-    @classmethod
-    def _camel_to_underscore(cls, word):
-        return re.sub('(?!^)([A-Z]+)', r'_\1', word).lower()
-
-    @classmethod
-    def _model_type(cls, job_type):
-        # Django >= 1.9
-        #app = apps.get_app_config('main')
-        model_str = cls._underscore_to_camel(job_type)
-        try:
-            return apps.get_model('main', model_str)
-        except LookupError:
-            print("Lookup model error")
-            return None
-
-    @classmethod
     def get_instance_by_type(cls, job_type, job_id):
-        model = cls._model_type(job_type)
+        model = get_model_for_type(job_type)
         if not model:
             return None
         return model.objects.get(id=job_id)
 
     def model_to_str(self):
-        return UnifiedJobTypeStringMixin._camel_to_underscore(self.__class__.__name__)
+        return camelcase_to_underscore(self.__class__.__name__)
 
 
 class UnifiedJobDeprecatedStdout(models.Model):
@@ -555,6 +540,7 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
 
     class Meta:
         app_label = 'main'
+        ordering = ('id',)
 
     old_pk = models.PositiveIntegerField(
         null=True,
@@ -618,6 +604,7 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
         choices=STATUS_CHOICES,
         default='new',
         editable=False,
+        db_index=True,
     )
     failed = models.BooleanField(
         default=False,
@@ -1226,6 +1213,23 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
     def pre_start(self, **kwargs):
         if not self.can_start:
             self.job_explanation = u'%s is not in a startable state: %s, expecting one of %s' % (self._meta.verbose_name, self.status, str(('new', 'waiting')))
+            self.save(update_fields=['job_explanation'])
+            return (False, None)
+
+        # verify that any associated credentials aren't missing required field data
+        missing_credential_inputs = []
+        for credential in self.credentials.all():
+            defined_fields = credential.credential_type.defined_fields
+            for required in credential.credential_type.inputs.get('required', []):
+                if required in defined_fields and not credential.has_input(required):
+                    missing_credential_inputs.append(required)
+
+        if missing_credential_inputs:
+            self.job_explanation = '{} cannot start because Credential {} does not provide one or more required fields ({}).'.format(
+                self._meta.verbose_name.title(),
+                credential.name,
+                ', '.join(sorted(missing_credential_inputs))
+            )
             self.save(update_fields=['job_explanation'])
             return (False, None)
 

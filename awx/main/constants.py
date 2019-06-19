@@ -37,6 +37,17 @@ ENV_BLACKLIST = frozenset((
     'INVENTORY_ID', 'INVENTORY_SOURCE_ID', 'INVENTORY_UPDATE_ID',
     'AD_HOC_COMMAND_ID', 'REST_API_URL', 'REST_API_TOKEN', 'MAX_EVENT_RES',
     'CALLBACK_QUEUE', 'CALLBACK_CONNECTION', 'CACHE',
-    'JOB_CALLBACK_DEBUG', 'INVENTORY_HOSTVARS', 'FACT_QUEUE',
+    'JOB_CALLBACK_DEBUG', 'INVENTORY_HOSTVARS',
     'AWX_HOST', 'PROJECT_REVISION'
 ))
+
+# loggers that may be called in process of emitting a log
+LOGGER_BLACKLIST = (
+    'awx.main.utils.handlers',
+    'awx.main.utils.formatters',
+    'awx.main.utils.filters',
+    'awx.main.utils.encryption',
+    'awx.main.utils.log',
+    # loggers that may be called getting logging settings
+    'awx.conf'
+)

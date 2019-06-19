@@ -18,9 +18,9 @@ from django.db import IntegrityError, connection
 from django.utils.functional import curry
 from django.shortcuts import get_object_or_404, redirect
 from django.apps import apps
+from django.utils.deprecation import MiddlewareMixin
 from django.utils.translation import ugettext_lazy as _
-from django.core.urlresolvers import reverse
-from django.urls import resolve
+from django.urls import reverse, resolve
 
 from awx.main.models import ActivityStream
 from awx.main.utils.named_url_graph import generate_graph, GraphNode
@@ -32,7 +32,7 @@ analytics_logger = logging.getLogger('awx.analytics.activity_stream')
 perf_logger = logging.getLogger('awx.analytics.performance')
 
 
-class TimingMiddleware(threading.local):
+class TimingMiddleware(threading.local, MiddlewareMixin):
 
     dest = '/var/log/tower/profile'
 
@@ -65,11 +65,12 @@ class TimingMiddleware(threading.local):
         return filepath
 
 
-class ActivityStreamMiddleware(threading.local):
+class ActivityStreamMiddleware(threading.local, MiddlewareMixin):
 
-    def __init__(self):
+    def __init__(self, get_response=None):
         self.disp_uid = None
         self.instance_ids = []
+        super().__init__(get_response)
 
     def process_request(self, request):
         if hasattr(request, 'user') and hasattr(request.user, 'is_authenticated') and request.user.is_authenticated():
@@ -119,7 +120,7 @@ class ActivityStreamMiddleware(threading.local):
                     self.instance_ids.append(instance.id)
 
 
-class SessionTimeoutMiddleware(object):
+class SessionTimeoutMiddleware(MiddlewareMixin):
     """
     Resets the session timeout for both the UI and the actual session for the API
     to the value of SESSION_COOKIE_AGE on every request if there is a valid session.
@@ -127,8 +128,11 @@ class SessionTimeoutMiddleware(object):
 
     def process_response(self, request, response):
         should_skip = 'HTTP_X_WS_SESSION_QUIET' in request.META
-        req_session = getattr(request, 'session', None)
-        if req_session and not req_session.is_empty() and should_skip is False:
+        # Something went wrong, such as upgrade-in-progress page
+        if not hasattr(request, 'session'):
+            return response
+        # Only update the session if it hasn't been flushed by being forced to log out.
+        if request.session and not request.session.is_empty() and not should_skip:
             expiry = int(settings.SESSION_COOKIE_AGE)
             request.session.set_expiry(expiry)
             response['Session-Timeout'] = expiry
@@ -149,9 +153,9 @@ def _customize_graph():
         settings.NAMED_URL_GRAPH[Instance].add_bindings()
 
 
-class URLModificationMiddleware(object):
+class URLModificationMiddleware(MiddlewareMixin):
 
-    def __init__(self):
+    def __init__(self, get_response=None):
         models = [m for m in apps.get_app_config('main').get_models() if hasattr(m, 'get_absolute_url')]
         generate_graph(models)
         _customize_graph()
@@ -175,6 +179,7 @@ class URLModificationMiddleware(object):
             category=_('Named URL'),
             category_slug='named-url',
         )
+        super().__init__(get_response)
 
     def _named_url_to_pk(self, node, named_url):
         kwargs = {}
@@ -205,7 +210,7 @@ class URLModificationMiddleware(object):
             request.path_info = new_path
 
 
-class MigrationRanCheckMiddleware(object):
+class MigrationRanCheckMiddleware(MiddlewareMixin):
 
     def process_request(self, request):
         executor = MigrationExecutor(connection)

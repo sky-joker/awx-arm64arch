@@ -28,6 +28,7 @@ class OAuth2Application(AbstractApplication):
         app_label = 'main'
         verbose_name = _('application')
         unique_together = (("name", "organization"),)
+        ordering = ('organization', 'name')
     
     CLIENT_CONFIDENTIAL = "confidential"
     CLIENT_PUBLIC = "public"
@@ -37,11 +38,9 @@ class OAuth2Application(AbstractApplication):
     )
 
     GRANT_AUTHORIZATION_CODE = "authorization-code"
-    GRANT_IMPLICIT = "implicit"
     GRANT_PASSWORD = "password"
     GRANT_TYPES = (
         (GRANT_AUTHORIZATION_CODE, _("Authorization code")),
-        (GRANT_IMPLICIT, _("Implicit")),
         (GRANT_PASSWORD, _("Resource owner password-based")),
     )
 
@@ -89,6 +88,7 @@ class OAuth2AccessToken(AbstractAccessToken):
     class Meta:
         app_label = 'main'
         verbose_name = _('access token')
+        ordering = ('id',)
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, 

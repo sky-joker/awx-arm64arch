@@ -1,5 +1,28 @@
-export default ['$scope', '$filter', '$state', 'Alert', 'resolvedModels', 'Dataset', 'InstanceGroupsStrings','ProcessErrors', 'Prompt', 'Wait',
-    function($scope, $filter, $state, Alert, resolvedModels, Dataset, strings, ProcessErrors, Prompt, Wait) {
+export default [
+    '$rootScope',
+    '$scope',
+    '$filter',
+    '$state',
+    'Alert',
+    'resolvedModels',
+    'Dataset',
+    'InstanceGroupsStrings',
+    'ProcessErrors',
+    'Prompt',
+    'Wait',
+    function(
+        $rootScope,
+        $scope,
+        $filter,
+        $state,
+        Alert,
+        resolvedModels,
+        Dataset,
+        strings,
+        ProcessErrors,
+        Prompt,
+        Wait
+    ) {
         const vm = this;
         const { instanceGroup } = resolvedModels;
         let paginateQuerySet = {};
@@ -10,6 +33,7 @@ export default ['$scope', '$filter', '$state', 'Alert', 'resolvedModels', 'Datas
         init();
 
         function init(){
+            $rootScope.breadcrumb.instance_group_name = $filter('sanitize')(instanceGroup.get('name'));
             $scope.list = {
                 iterator: 'instance_group',
                 name: 'instance_groups'
@@ -43,10 +67,11 @@ export default ['$scope', '$filter', '$state', 'Alert', 'resolvedModels', 'Datas
 
         vm.toolbarSortOptions = [
             toolbarSortDefault,
-            {
-                label: `${strings.get('sort.NAME_DESCENDING')}`,
-                value: '-name'
-            }
+            { label: `${strings.get('sort.NAME_DESCENDING')}`, value: '-name' },
+            { label: `${strings.get('sort.CREATED_ASCENDING')}`, value: 'created' },
+            { label: `${strings.get('sort.CREATED_DESCENDING')}`, value: '-created' },
+            { label: `${strings.get('sort.MODIFIED_ASCENDING')}`, value: 'modified' },
+            { label: `${strings.get('sort.MODIFIED_DESCENDING')}`, value: '-modified' }
         ];
 
         vm.toolbarSortValue = toolbarSortDefault;
@@ -83,7 +108,7 @@ export default ['$scope', '$filter', '$state', 'Alert', 'resolvedModels', 'Datas
 
         vm.rowAction = {
             trash: instance_group => {
-                return vm.isSuperuser && instance_group.name !== 'tower';
+                return vm.isSuperuser && instance_group.name !== 'tower' && !instance_group.is_controller && !instance_group.is_isolated;
             }
         };
 

@@ -21,7 +21,6 @@ register(
     help_text=_('Enable capturing activity for the activity stream.'),
     category=_('System'),
     category_slug='system',
-    feature_required='activity_streams',
 )
 
 register(
@@ -31,7 +30,6 @@ register(
     help_text=_('Enable capturing activity for the activity stream when running inventory sync.'),
     category=_('System'),
     category_slug='system',
-    feature_required='activity_streams',
 )
 
 register(
@@ -120,10 +118,19 @@ register(
     default=_load_default_license_from_file,
     label=_('License'),
     help_text=_('The license controls which features and functionality are '
-                'enabled. Use /api/v1/config/ to update or change '
+                'enabled. Use /api/v2/config/ to update or change '
                 'the license.'),
     category=_('System'),
     category_slug='system',
+)
+
+register(
+    'INSTALL_UUID',
+    field_class=fields.CharField,
+    label=_('Unique identifier for an AWX/Tower installation'),
+    category=_('System'),
+    category_slug='system',
+    read_only=True,
 )
 
 register(
@@ -299,6 +306,16 @@ register(
     category=_('Jobs'),
     category_slug='jobs',
     placeholder={'HTTP_PROXY': 'myproxy.local:8080'},
+)
+
+register(
+    'INSIGHTS_TRACKING_STATE',
+    field_class=fields.BooleanField,
+    default=False,
+    label=_('Gather data for Automation Insights'),
+    help_text=_('Enables Tower to gather data on automation and send it to Red Hat Insights.'),
+    category=_('System'),
+    category_slug='system',
 )
 
 register(
@@ -550,6 +567,16 @@ register(
                 'awx.anlytics ignore this setting)'),
     category=_('Logging'),
     category_slug='logging',
+)
+
+
+register(
+    'BROKER_DURABILITY',
+    field_class=fields.BooleanField,
+    label=_('Message Durability'),
+    help_text=_('When set (the default), underlying queues will be persisted to disk.  Disable this to enable higher message bus throughput.'),
+    category=_('System'),
+    category_slug='system',
 )
 
 

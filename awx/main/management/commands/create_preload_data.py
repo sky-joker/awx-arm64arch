@@ -34,7 +34,7 @@ class Command(BaseCommand):
                             scm_update_cache_timeout=0,
                             organization=o)
                 p.save(skip_update=True)
-                ssh_type = CredentialType.from_v1_kind('ssh')
+                ssh_type = CredentialType.objects.filter(namespace='ssh').first()
                 c = Credential.objects.create(credential_type=ssh_type,
                                               name='Demo Credential',
                                               inputs={
@@ -47,7 +47,7 @@ class Command(BaseCommand):
                                              created_by=superuser)
                 Host.objects.create(name='localhost',
                                     inventory=i,
-                                    variables="ansible_connection: local",
+                                    variables="ansible_connection: local\nansible_python_interpreter: '{{ ansible_playbook_python }}'",
                                     created_by=superuser)
                 jt = JobTemplate.objects.create(name='Demo Job Template',
                                                 playbook='hello_world.yml',

@@ -1,12 +1,36 @@
 /* Tests for the user CRUD operations. */
 import uuid from 'uuid';
+import {
+    getAuditor,
+    getOrganization,
+    getUser
+} from '../fixtures';
 
 const row = '#users_table .List-tableRow';
 const testID = uuid().substr(0, 8);
 
+let data;
 const store = {
     organization: {
         name: `org-${testID}`
+    },
+    admin: {
+        email: `email-admin-${testID}@example.com`,
+        firstName: `first-admin-${testID}`,
+        lastName: `last-admin-${testID}`,
+        password: `admin-${testID}`,
+        username: `admin-${testID}`,
+        usernameDefault: `admin-${testID}`,
+        type: 'administrator',
+    },
+    auditor: {
+        email: `email-auditor-${testID}@example.com`,
+        firstName: `first-auditor-${testID}`,
+        lastName: `last-auditor-${testID}`,
+        password: `auditor-${testID}`,
+        username: `auditor-${testID}`,
+        usernameDefault: `auditor-${testID}`,
+        type: 'auditor',
     },
     user: {
         email: `email-${testID}@example.com`,
@@ -14,40 +38,70 @@ const store = {
         lastName: `last-${testID}`,
         password: `${testID}`,
         username: `user-${testID}`,
+        usernameDefault: `user-${testID}`,
+        type: 'normal',
     },
 };
 
 module.exports = {
     before: (client, done) => {
+        // generate a unique username on each attempt.
+        const uniqueUser = uuid().substr(0, 8);
+        Object.keys(store).forEach(key => {
+            if ('username' in store[key]) {
+                store[key].username = `${store[key].usernameDefault}-${uniqueUser}`;
+            }
+        });
+        const resources = [
+            getOrganization(store.organization.name),
+            getAuditor(store.auditor.username),
+            getUser(store.user.username),
+            getUser(store.admin.username, true)
+        ];
+
+        Promise.all(resources)
+            .then(([organization, auditor, user, admin]) => {
+                store.organization.name = `${store.organization.name}-organization`;
+                data = { organization, auditor, user, admin };
+                done();
+            });
         client.login();
         client.waitForAngular();
-
-        client.inject(
-            [store, 'OrganizationModel'],
-            (_store_, Model) => new Model().http.post({ data: _store_.organization }),
-            ({ data }) => {
-                store.organization = data;
-                done();
-            }
-        );
     },
-    'create an user': client => {
+    'create a system administrator': (client) => {
+        client.login();
         const users = client.page.users();
         users.load();
         client.waitForSpinny();
-        users.section.list
-            .waitForElementVisible('@add')
-            .click('@add');
-        users.section.add
-            .waitForElementVisible('@title')
-            .setValue('@organization', store.organization.name)
-            .setValue('@email', store.user.email)
-            .setValue('@username', store.user.username)
-            .setValue('@password', store.user.password)
-            .setValue('@confirmPassword', store.user.password)
-            .click('@save');
+        users.create(store.admin, store.organization);
+        users.search(store.admin.username);
+        client.logout();
+    },
+    'create a system auditor': (client) => {
+        client.login(store.admin.username, store.admin.password);
+        const users = client.page.users();
+        users.load();
         client.waitForSpinny();
-        users.search(store.user.username);
+        users.create(store.auditor, store.organization);
+        users.search(store.auditor.username);
+        client.logout();
+    },
+    'check if the new system auditor can login': (client) => {
+        client.login(store.auditor.username, store.auditor.password);
+        client.logout();
+    },
+    'create an user': client => {
+        client.login(store.admin.username, store.admin.password);
+        const users = client.page.users();
+        users.load();
+        client.waitForSpinny();
+        const newUser = {
+            email: store.user.email,
+            password: store.user.password,
+            username: store.user.username,
+        };
+        users.create(newUser, store.organization);
+        users.search(newUser.username);
     },
     'edit an user': client => {
         const users = client.page.users();
@@ -63,31 +117,31 @@ module.exports = {
             .click('@save');
         client.waitForSpinny();
         users.search(store.user.username);
-        users.expect.element(row).text.contain(`${store.user.username}\n${store.user.firstName[0].toUpperCase() + store.user.firstName.slice(1)}\n${store.user.lastName}`);
+        users.expect.element(row).text.contain(`${store.user.username}\n${store.user.firstName}\n${store.user.lastName}`);
+        client.logout();
     },
     'check if the new user can login': (client) => {
-        client.logout();
         client.login(store.user.username, store.user.password);
         client.logout();
-        client.login();
     },
-    'delete the user': (client) => {
+    'delete admin': (client) => {
+        client.login();
         const users = client.page.users();
         users.load();
         client.waitForSpinny();
-        users.search(store.user.username);
-        const deleteButton = `${row} i[class*="fa-trash-o"]`;
-        const modalAction = '.modal-dialog #prompt_action_btn';
-        users
-            .waitForElementVisible(deleteButton)
-            .click(deleteButton)
-            .waitForElementVisible(modalAction)
-            .click(modalAction)
-            .waitForSpinny();
-        const searchResults = '.List-searchNoResults';
-        users
-            .waitForElementVisible(searchResults)
-            .expect.element(searchResults).text.contain('No records matched your search.');
+        users.delete(store.admin.username);
+    },
+    'delete auditor': (client) => {
+        const users = client.page.users();
+        users.load();
+        client.waitForSpinny();
+        users.delete(store.auditor.username);
+    },
+    'delete user': (client) => {
+        const users = client.page.users();
+        users.load();
+        client.waitForSpinny();
+        users.delete(store.user.username);
     },
     after: client => {
         client.end();

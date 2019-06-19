@@ -8,6 +8,7 @@
             list="vm.list"
             collection="vm.templates"
             dataset="vm.dataset"
+            default-params="vm.defaultParams"
             search-tags="vm.searchTags"
             search-bar-full-width="vm.isPortalMode">
         </smart-search>
@@ -33,10 +34,13 @@
     </div>
     <at-list-toolbar
         ng-if="vm.templates.length > 0"
-        sort-only="false"
-        on-collapse="vm.onCollapse"
         on-expand="vm.onExpand"
-        is-collapsed="vm.isCollapsed">
+        on-collapse="vm.onCollapse"
+        is-collapsed="vm.isCollapsed"
+        sort-only="false"
+        sort-value="vm.toolbarSortValue"
+        sort-options="vm.toolbarSortOptions"
+        on-sort="vm.onToolbarSort">
     </at-list-toolbar>
     <at-list results="vm.templates" id="templates_list">
         <at-row ng-repeat="template in vm.templates"
@@ -49,13 +53,13 @@
                     <div class="at-Row-container">
                         <at-row-item
                             header-value="{{ template.name }}"
-                            header-link="/#/templates/job_template/{{ template.id }}"
+                            header-state="templates.editJobTemplate({job_template_id:{{template.id}}})"
                             header-tag="{{ vm.templateTypes[template.type] }}"
                             ng-if="template.type === 'job_template'">
                         </at-row-item>
                         <at-row-item
                             header-value="{{ template.name }}"
-                            header-link="/#/templates/workflow_job_template/{{ template.id }}"
+                            header-state="templates.editWorkflowJobTemplate({workflow_job_template_id:{{template.id}}})"
                             header-tag="{{ vm.templateTypes[template.type] }}"
                             ng-if="template.type === 'workflow_job_template'">
                         </at-row-item>

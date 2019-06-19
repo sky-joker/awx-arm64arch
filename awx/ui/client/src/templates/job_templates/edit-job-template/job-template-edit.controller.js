@@ -54,6 +54,12 @@ export default
 
                 CallbackHelpInit({ scope: $scope });
 
+                // To toggle notifications a user needs to have a read role on the JT
+                // _and_ have at least a notification template admin role on an org.
+                // If the user has gotten this far it's safe to say they have
+                // at least read access to the JT
+                $scope.sufficientRoleForNotifToggle = isNotificationAdmin;
+                $scope.sufficientRoleForNotif =  isNotificationAdmin || $scope.user_is_system_auditor;
                 $scope.playbook_options = null;
                 $scope.playbook = null;
                 $scope.mode = 'edit';
@@ -66,7 +72,6 @@ export default
                 $scope.skip_tag_options = [];
                 const virtualEnvs = ConfigData.custom_virtualenvs || [];
                 $scope.custom_virtualenvs_options = virtualEnvs;
-                $scope.isNotificationAdmin = isNotificationAdmin || false;
 
                 SurveyControllerInit({
                     scope: $scope,
@@ -286,7 +291,8 @@ export default
                     scope: $scope,
                     field_id: 'extra_vars',
                     variable: 'extra_vars',
-                    onChange: callback
+                    onChange: callback,
+                    readOnly: !$scope.job_template_obj.summary_fields.user_capabilities.edit
                 });
                 jobTemplateLoadFinished();
                 launchHasBeenEnabled = true;
@@ -527,7 +533,7 @@ export default
                 var credDefer = MultiCredentialService
                     .saveRelated(jobTemplateData, $scope.multiCredential.selectedCredentials);
 
-                InstanceGroupsService.editInstanceGroups(instance_group_url, $scope.instance_groups)
+                const instanceGroupDefer = InstanceGroupsService.editInstanceGroups(instance_group_url, $scope.instance_groups)
                     .catch(({data, status}) => {
                         ProcessErrors($scope, data, status, form, {
                             hdr: 'Error!',
@@ -604,7 +610,7 @@ export default
 
                         Rest.setUrl(data.related.labels);
 
-                        var defers = [credDefer];
+                        var defers = [credDefer, instanceGroupDefer];
                         for (var i = 0; i < toPost.length; i++) {
                             defers.push(Rest.post(toPost[i]));
                         }

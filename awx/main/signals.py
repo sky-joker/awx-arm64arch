@@ -20,7 +20,6 @@ from django.db.models.signals import (
 )
 from django.dispatch import receiver
 from django.contrib.auth import SESSION_KEY
-from django.contrib.contenttypes.models import ContentType
 from django.contrib.sessions.models import Session
 from django.utils import timezone
 
@@ -192,22 +191,28 @@ def sync_superuser_status_to_rbac(instance, **kwargs):
 
 
 def rbac_activity_stream(instance, sender, **kwargs):
-    user_type = ContentType.objects.get_for_model(User)
     # Only if we are associating/disassociating
     if kwargs['action'] in ['pre_add', 'pre_remove']:
-        # Only if this isn't for the User.admin_role
-        if hasattr(instance, 'content_type'):
-            if instance.content_type in [None, user_type]:
+        if hasattr(instance, 'content_type'):  # Duck typing, migration-independent isinstance(instance, Role)
+            if instance.content_type_id is None and instance.singleton_name == ROLE_SINGLETON_SYSTEM_ADMINISTRATOR:
+                # Skip entries for the system admin role because user serializer covers it
+                # System auditor role is shown in the serializer, but its relationship is
+                # managed separately, its value is incorrect, and a correction entry is needed
                 return
-            elif sender.__name__ == 'Role_parents':
+            # This juggles which role to use, because could be A->B or B->A association
+            if sender.__name__ == 'Role_parents':
                 role = kwargs['model'].objects.filter(pk__in=kwargs['pk_set']).first()
                 # don't record implicit creation / parents in activity stream
                 if role is not None and is_implicit_parent(parent_role=role, child_role=instance):
                     return
             else:
                 role = instance
-            instance = instance.content_object
+            # If a singleton role is the instance, the singleton role is acted on
+            # otherwise the related object is considered to be acted on
+            if instance.content_object:
+                instance = instance.content_object
         else:
+            # Association with actor, like role->user
             role = kwargs['model'].objects.filter(pk__in=kwargs['pk_set']).first()
 
         activity_stream_associate(sender, instance, role=role, **kwargs)
@@ -403,6 +408,7 @@ def model_serializer_mapping():
     from awx.conf.serializers import SettingSerializer
     return {
         Setting: SettingSerializer,
+        models.User: serializers.UserActivityStreamSerializer,
         models.Organization: serializers.OrganizationSerializer,
         models.Inventory: serializers.InventorySerializer,
         models.Host: serializers.HostSerializer,
@@ -646,20 +652,19 @@ def save_user_session_membership(sender, **kwargs):
         return
     if not session:
         return
-    user = session.get_decoded().get(SESSION_KEY, None)
-    if not user:
+    user_id = session.get_decoded().get(SESSION_KEY, None)
+    if not user_id:
         return
-    user = User.objects.get(pk=user)
-    if UserSessionMembership.objects.filter(user=user, session=session).exists():
+    if UserSessionMembership.objects.filter(user=user_id, session=session).exists():
         return
-    UserSessionMembership(user=user, session=session, created=timezone.now()).save()
-    expired = UserSessionMembership.get_memberships_over_limit(user)
+    UserSessionMembership(user_id=user_id, session=session, created=timezone.now()).save()
+    expired = UserSessionMembership.get_memberships_over_limit(user_id)
     for membership in expired:
         Session.objects.filter(session_key__in=[membership.session_id]).delete()
         membership.delete()
     if len(expired):
         consumers.emit_channel_notification(
-            'control-limit_reached_{}'.format(user.pk),
+            'control-limit_reached_{}'.format(user_id),
             dict(group_name='control', reason='limit_reached')
         )
 
@@ -674,7 +679,7 @@ def create_access_token_user_if_missing(sender, **kwargs):
         post_save.connect(create_access_token_user_if_missing, sender=OAuth2AccessToken)
 
 
-# Connect the Instance Group to Activity Stream receivers. 
+# Connect the Instance Group to Activity Stream receivers.
 post_save.connect(activity_stream_create, sender=InstanceGroup, dispatch_uid=str(InstanceGroup) + "_create")
 pre_save.connect(activity_stream_update, sender=InstanceGroup, dispatch_uid=str(InstanceGroup) + "_update")
 pre_delete.connect(activity_stream_delete, sender=InstanceGroup, dispatch_uid=str(InstanceGroup) + "_delete")

@@ -19,14 +19,11 @@ from awx.api.versioning import reverse
 from awx.main.managers import InstanceManager, InstanceGroupManager
 from awx.main.fields import JSONField
 from awx.main.models.base import BaseModel, HasEditsMixin
-from awx.main.models.inventory import InventoryUpdate
-from awx.main.models.jobs import Job
-from awx.main.models.projects import ProjectUpdate
 from awx.main.models.unified_jobs import UnifiedJob
 from awx.main.utils import get_cpu_capacity, get_mem_capacity, get_system_task_capacity
 from awx.main.models.mixins import RelatedJobsMixin
 
-__all__ = ('Instance', 'InstanceGroup', 'JobOrigin', 'TowerScheduleState',)
+__all__ = ('Instance', 'InstanceGroup', 'TowerScheduleState', 'TowerAnalyticsState')
 
 
 class HasPolicyEditsMixin(HasEditsMixin):
@@ -98,6 +95,7 @@ class Instance(HasPolicyEditsMixin, BaseModel):
 
     class Meta:
         app_label = 'main'
+        ordering = ("hostname",)
 
     POLICY_FIELDS = frozenset(('managed_by_policy', 'hostname', 'capacity_adjustment'))
 
@@ -143,7 +141,10 @@ class Instance(HasPolicyEditsMixin, BaseModel):
     def refresh_capacity(self):
         cpu = get_cpu_capacity()
         mem = get_mem_capacity()
-        self.capacity = get_system_task_capacity(self.capacity_adjustment)
+        if self.enabled:
+            self.capacity = get_system_task_capacity(self.capacity_adjustment)
+        else:
+            self.capacity = 0
         self.cpu = cpu[0]
         self.memory = mem[0]
         self.cpu_capacity = cpu[1]
@@ -172,7 +173,8 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
         help_text=_('Instance Group to remotely control this group.'),
         editable=False,
         default=None,
-        null=True
+        null=True,
+        on_delete=models.CASCADE
     )
     policy_instance_percentage = models.IntegerField(
         default=0,
@@ -208,6 +210,14 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
     def jobs_total(self):
         return UnifiedJob.objects.filter(instance_group=self).count()
 
+    @property
+    def is_controller(self):
+        return self.controlled_groups.exists()
+
+    @property
+    def is_isolated(self):
+        return bool(self.controller)
+
     '''
     RelatedJobsMixin
     '''
@@ -221,9 +231,7 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
 
     def fit_task_to_most_remaining_capacity_instance(self, task):
         instance_most_capacity = None
-        for i in self.instances.filter(capacity__gt=0).order_by('hostname'):
-            if not i.enabled:
-                continue
+        for i in self.instances.filter(capacity__gt=0, enabled=True).order_by('hostname'):
             if i.remaining_capacity >= task.task_impact and \
                     (instance_most_capacity is None or
                      i.remaining_capacity > instance_most_capacity.remaining_capacity):
@@ -232,7 +240,7 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
 
     def find_largest_idle_instance(self):
         largest_instance = None
-        for i in self.instances.filter(capacity__gt=0).order_by('hostname'):
+        for i in self.instances.filter(capacity__gt=0, enabled=True).order_by('hostname'):
             if i.jobs_running == 0:
                 if largest_instance is None:
                     largest_instance = i
@@ -243,7 +251,7 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
     def choose_online_controller_node(self):
         return random.choice(list(self.controller
                                       .instances
-                                      .filter(capacity__gt=0)
+                                      .filter(capacity__gt=0, enabled=True)
                                       .values_list('hostname', flat=True)))
 
 
@@ -251,22 +259,8 @@ class TowerScheduleState(SingletonModel):
     schedule_last_run = models.DateTimeField(auto_now_add=True)
 
 
-class JobOrigin(models.Model):
-    """A model representing the relationship between a unified job and
-    the instance that was responsible for starting that job.
-
-    It may be possible that a job has no origin (the common reason for this
-    being that the job was started on Tower < 2.1 before origins were a thing).
-    This is fine, and code should be able to handle it. A job with no origin
-    is always assumed to *not* have the current instance as its origin.
-    """
-    unified_job = models.OneToOneField(UnifiedJob, related_name='job_origin')
-    instance = models.ForeignKey(Instance)
-    created = models.DateTimeField(auto_now_add=True)
-    modified = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        app_label = 'main'
+class TowerAnalyticsState(SingletonModel):
+    last_run = models.DateTimeField(auto_now_add=True)
 
 
 def schedule_policy_task():
@@ -296,26 +290,52 @@ def on_instance_deleted(sender, instance, using, **kwargs):
     schedule_policy_task()
 
 
-# Unfortunately, the signal can't just be connected against UnifiedJob; it
-# turns out that creating a model's subclass doesn't fire the signal for the
-# superclass model.
-@receiver(post_save, sender=InventoryUpdate)
-@receiver(post_save, sender=Job)
-@receiver(post_save, sender=ProjectUpdate)
-def on_job_create(sender, instance, created=False, raw=False, **kwargs):
-    """When a new job is created, save a record of its origin (the machine
-    that started the job).
-    """
-    # Sanity check: We only want to create a JobOrigin record in cases where
-    # we are making a new record, and in normal situations.
-    #
-    # In other situations, we simply do nothing.
-    if raw or not created:
-        return
+class UnifiedJobTemplateInstanceGroupMembership(models.Model):
 
-    # Create the JobOrigin record, which attaches to the current instance
-    # (which started the job).
-    job_origin, new = JobOrigin.objects.get_or_create(
-        instance=Instance.objects.me(),
-        unified_job=instance,
+    unifiedjobtemplate = models.ForeignKey(
+        'UnifiedJobTemplate',
+        on_delete=models.CASCADE
+    )
+    instancegroup = models.ForeignKey(
+        'InstanceGroup',
+        on_delete=models.CASCADE
+    )
+    position = models.PositiveIntegerField(
+        null=True,
+        default=None,
+        db_index=True,
+    )
+
+
+class OrganizationInstanceGroupMembership(models.Model):
+
+    organization = models.ForeignKey(
+        'Organization',
+        on_delete=models.CASCADE
+    )
+    instancegroup = models.ForeignKey(
+        'InstanceGroup',
+        on_delete=models.CASCADE
+    )
+    position = models.PositiveIntegerField(
+        null=True,
+        default=None,
+        db_index=True,
+    )
+
+
+class InventoryInstanceGroupMembership(models.Model):
+
+    inventory = models.ForeignKey(
+        'Inventory',
+        on_delete=models.CASCADE
+    )
+    instancegroup = models.ForeignKey(
+        'InstanceGroup',
+        on_delete=models.CASCADE
+    )
+    position = models.PositiveIntegerField(
+        null=True,
+        default=None,
+        db_index=True,
     )

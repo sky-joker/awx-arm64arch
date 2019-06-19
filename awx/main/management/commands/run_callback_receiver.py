@@ -3,14 +3,15 @@
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
-from kombu import Connection, Exchange, Queue
+from kombu import Exchange, Queue
 
+from awx.main.dispatch.kombu import Connection
 from awx.main.dispatch.worker import AWXConsumer, CallbackBrokerWorker
 
 
 class Command(BaseCommand):
     '''
-    Save Job Callback receiver (see awx.plugins.callbacks.job_event_callback)
+    Save Job Callback receiver
     Runs as a management command and receives job save events.  It then hands
     them off to worker processors (see Worker) which writes them to the database
     '''

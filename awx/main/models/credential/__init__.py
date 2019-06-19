@@ -4,6 +4,7 @@ import functools
 import inspect
 import logging
 import os
+from pkg_resources import iter_entry_points
 import re
 import stat
 import tempfile
@@ -17,16 +18,22 @@ from django.db import models
 from django.utils.translation import ugettext_lazy as _, ugettext_noop
 from django.core.exceptions import ValidationError
 from django.utils.encoding import force_text
+from django.utils.functional import cached_property
 
 # AWX
 from awx.api.versioning import reverse
 from awx.main.fields import (ImplicitRoleField, CredentialInputField,
                              CredentialTypeInputField,
-                             CredentialTypeInjectorField)
+                             CredentialTypeInjectorField,
+                             DynamicCredentialInputField,)
 from awx.main.utils import decrypt_field, classproperty
 from awx.main.utils.safe_yaml import safe_dump
 from awx.main.validators import validate_ssh_private_key
-from awx.main.models.base import CommonModelNameNotUnique, PasswordFieldsModel
+from awx.main.models.base import (
+    CommonModelNameNotUnique,
+    PasswordFieldsModel,
+    PrimordialModel
+)
 from awx.main.models.mixins import ResourceMixin
 from awx.main.models.rbac import (
     ROLE_SINGLETON_SYSTEM_ADMINISTRATOR,
@@ -35,9 +42,13 @@ from awx.main.models.rbac import (
 from awx.main.utils import encrypt_field
 from . import injectors as builtin_injectors
 
-__all__ = ['Credential', 'CredentialType', 'V1Credential', 'build_safe_env']
+__all__ = ['Credential', 'CredentialType', 'CredentialInputSource', 'build_safe_env']
 
 logger = logging.getLogger('awx.main.models.credential')
+credential_plugins = dict(
+    (ep.name, ep.load())
+    for ep in iter_entry_points('awx.credential_plugins')
+)
 
 HIDDEN_PASSWORD = '**********'
 
@@ -62,165 +73,6 @@ def build_safe_env(env):
     return safe_env
 
 
-class V1Credential(object):
-
-    #
-    # API v1 backwards compat; as long as we continue to support the
-    # /api/v1/credentials/ endpoint, we'll keep these definitions around.
-    # The credential serializers are smart enough to detect the request
-    # version and use *these* fields for constructing the serializer if the URL
-    # starts with /api/v1/
-    #
-    PASSWORD_FIELDS = ('password', 'security_token', 'ssh_key_data',
-                       'ssh_key_unlock', 'become_password',
-                       'vault_password', 'secret', 'authorize_password')
-    KIND_CHOICES = [
-        ('ssh', 'Machine'),
-        ('net', 'Network'),
-        ('scm', 'Source Control'),
-        ('aws', 'Amazon Web Services'),
-        ('vmware', 'VMware vCenter'),
-        ('satellite6', 'Red Hat Satellite 6'),
-        ('cloudforms', 'Red Hat CloudForms'),
-        ('gce', 'Google Compute Engine'),
-        ('azure_rm', 'Microsoft Azure Resource Manager'),
-        ('openstack', 'OpenStack'),
-        ('rhv', 'Red Hat Virtualization'),
-        ('insights', 'Insights'),
-        ('tower', 'Ansible Tower'),
-    ]
-    FIELDS = {
-        'kind': models.CharField(
-            max_length=32,
-            choices=[
-                (kind[0], _(kind[1]))
-                for kind in KIND_CHOICES
-            ],
-            default='ssh',
-        ),
-        'cloud': models.BooleanField(
-            default=False,
-            editable=False,
-        ),
-        'host': models.CharField(
-            blank=True,
-            default='',
-            max_length=1024,
-            verbose_name=_('Host'),
-            help_text=_('The hostname or IP address to use.'),
-        ),
-        'username': models.CharField(
-            blank=True,
-            default='',
-            max_length=1024,
-            verbose_name=_('Username'),
-            help_text=_('Username for this credential.'),
-        ),
-        'password': models.CharField(
-            blank=True,
-            default='',
-            max_length=1024,
-            verbose_name=_('Password'),
-            help_text=_('Password for this credential (or "ASK" to prompt the '
-                        'user for machine credentials).'),
-        ),
-        'security_token': models.CharField(
-            blank=True,
-            default='',
-            max_length=1024,
-            verbose_name=_('Security Token'),
-            help_text=_('Security Token for this credential'),
-        ),
-        'project': models.CharField(
-            blank=True,
-            default='',
-            max_length=100,
-            verbose_name=_('Project'),
-            help_text=_('The identifier for the project.'),
-        ),
-        'domain': models.CharField(
-            blank=True,
-            default='',
-            max_length=100,
-            verbose_name=_('Domain'),
-            help_text=_('The identifier for the domain.'),
-        ),
-        'ssh_key_data': models.TextField(
-            blank=True,
-            default='',
-            verbose_name=_('SSH private key'),
-            help_text=_('RSA or DSA private key to be used instead of password.'),
-        ),
-        'ssh_key_unlock': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            verbose_name=_('SSH key unlock'),
-            help_text=_('Passphrase to unlock SSH private key if encrypted (or '
-                        '"ASK" to prompt the user for machine credentials).'),
-        ),
-        'become_method': models.CharField(
-            max_length=32,
-            blank=True,
-            default='',
-            help_text=_('Privilege escalation method.')
-        ),
-        'become_username': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            help_text=_('Privilege escalation username.'),
-        ),
-        'become_password': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            help_text=_('Password for privilege escalation method.')
-        ),
-        'vault_password': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            help_text=_('Vault password (or "ASK" to prompt the user).'),
-        ),
-        'authorize': models.BooleanField(
-            default=False,
-            help_text=_('Whether to use the authorize mechanism.'),
-        ),
-        'authorize_password': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            help_text=_('Password used by the authorize mechanism.'),
-        ),
-        'client': models.CharField(
-            max_length=128,
-            blank=True,
-            default='',
-            help_text=_('Client Id or Application Id for the credential'),
-        ),
-        'secret': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            help_text=_('Secret Token for this credential'),
-        ),
-        'subscription': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            help_text=_('Subscription identifier for this credential'),
-        ),
-        'tenant': models.CharField(
-            max_length=1024,
-            blank=True,
-            default='',
-            help_text=_('Tenant identifier for this credential'),
-        )
-    }
-
-
-
 class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
     '''
     A credential contains information about how to talk to a remote resource
@@ -239,6 +91,7 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
         'CredentialType',
         related_name='credentials',
         null=False,
+        on_delete=models.CASCADE,
         help_text=_('Specify the type of credential you want to create. Refer '
                     'to the Ansible Tower documentation for details on each type.')
     )
@@ -275,34 +128,9 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
         'admin_role',
     ])
 
-    def __getattr__(self, item):
-        if item != 'inputs':
-            if item in V1Credential.FIELDS:
-                return self.inputs.get(item, V1Credential.FIELDS[item].default)
-            elif item in self.inputs:
-                return self.inputs[item]
-        raise AttributeError(item)
-
-    def __setattr__(self, item, value):
-        if item in V1Credential.FIELDS and item in self.credential_type.defined_fields:
-            if value:
-                self.inputs[item] = value
-            elif item in self.inputs:
-                del self.inputs[item]
-            return
-        super(Credential, self).__setattr__(item, value)
-
     @property
     def kind(self):
-        # TODO 3.3: remove the need for this helper property by removing its
-        # usage throughout the codebase
-        type_ = self.credential_type
-        if type_.kind != 'cloud':
-            return type_.kind
-        for field in V1Credential.KIND_CHOICES:
-            kind, name = field
-            if name == type_.name:
-                return kind
+        return self.credential_type.namespace
 
     @property
     def cloud(self):
@@ -319,7 +147,7 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
     #
     @property
     def needs_ssh_password(self):
-        return self.credential_type.kind == 'ssh' and self.password == 'ASK'
+        return self.credential_type.kind == 'ssh' and self.inputs.get('password') == 'ASK'
 
     @property
     def has_encrypted_ssh_key_data(self):
@@ -339,17 +167,17 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
 
     @property
     def needs_ssh_key_unlock(self):
-        if self.credential_type.kind == 'ssh' and self.ssh_key_unlock in ('ASK', ''):
+        if self.credential_type.kind == 'ssh' and self.inputs.get('ssh_key_unlock') in ('ASK', ''):
             return self.has_encrypted_ssh_key_data
         return False
 
     @property
     def needs_become_password(self):
-        return self.credential_type.kind == 'ssh' and self.become_password == 'ASK'
+        return self.credential_type.kind == 'ssh' and self.inputs.get('become_password') == 'ASK'
 
     @property
     def needs_vault_password(self):
-        return self.credential_type.kind == 'vault' and self.vault_password == 'ASK'
+        return self.credential_type.kind == 'vault' and self.inputs.get('vault_password') == 'ASK'
 
     @property
     def passwords_needed(self):
@@ -363,6 +191,10 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
             else:
                 needed.append('vault_password')
         return needed
+
+    @cached_property
+    def dynamic_input_fields(self):
+        return [obj.input_field_name for obj in self.input_sources.all()]
 
     def _password_field_allows_ask(self, field):
         return field in self.credential_type.askable_fields
@@ -381,6 +213,10 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
 
         super(Credential, self).save(*args, **kwargs)
 
+    def mark_field_for_save(self, update_fields, field):
+        if 'inputs' not in update_fields:
+            update_fields.append('inputs')
+
     def encrypt_field(self, field, ask):
         if field not in self.inputs:
             return None
@@ -389,13 +225,6 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
             self.inputs[field] = encrypted
         elif field in self.inputs:
             del self.inputs[field]
-
-    def mark_field_for_save(self, update_fields, field):
-        if field in self.credential_type.secret_fields:
-            # If we've encrypted a v1 field, we actually want to persist
-            # self.inputs
-            field = 'inputs'
-        super(Credential, self).mark_field_for_save(update_fields, field)
 
     def display_inputs(self):
         field_val = self.inputs.copy()
@@ -414,7 +243,7 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
             type_alias = self.credential_type.name
         else:
             type_alias = self.credential_type_id
-        if self.kind == 'vault' and self.has_input('vault_id'):
+        if self.credential_type.kind == 'vault' and self.has_input('vault_id'):
             if display:
                 fmt_str = '{} (id={})'
             else:
@@ -441,6 +270,8 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
         :param field_name(str):        The name of the input field.
         :param default(optional[str]): A default return value to use.
         """
+        if self.credential_type.kind != 'external' and field_name in self.dynamic_input_fields:
+            return self._get_dynamic_input(field_name)
         if field_name in self.credential_type.secret_fields:
             try:
                 return decrypt_field(self, field_name)
@@ -461,7 +292,16 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
         raise AttributeError(field_name)
 
     def has_input(self, field_name):
+        if field_name in self.dynamic_input_fields:
+            return True
         return field_name in self.inputs and self.inputs[field_name] not in ('', None)
+
+    def _get_dynamic_input(self, field_name):
+        for input_source in self.input_sources.all():
+            if input_source.input_field_name == field_name:
+                return input_source.get_input_value()
+        else:
+            raise ValueError('{} is not a dynamic input field'.format(field_name))
 
 
 class CredentialType(CommonModelNameNotUnique):
@@ -484,6 +324,7 @@ class CredentialType(CommonModelNameNotUnique):
         ('scm', _('Source Control')),
         ('cloud', _('Cloud')),
         ('insights', _('Insights')),
+        ('external', _('External')),
     )
 
     kind = models.CharField(
@@ -525,14 +366,7 @@ class CredentialType(CommonModelNameNotUnique):
         return instance
 
     def get_absolute_url(self, request=None):
-        # Page does not exist in API v1
-        if request.version == 'v1':
-            return reverse('api:credential_type_detail', kwargs={'pk': self.pk})
         return reverse('api:credential_type_detail', kwargs={'pk': self.pk}, request=request)
-
-    @property
-    def unique_by_kind(self):
-        return self.kind != 'cloud'
 
     @property
     def defined_fields(self):
@@ -551,6 +385,16 @@ class CredentialType(CommonModelNameNotUnique):
             field['id'] for field in self.inputs.get('fields', [])
             if field.get('ask_at_runtime', False) is True
         ]
+
+    @property
+    def plugin(self):
+        if self.kind != 'external':
+            raise AttributeError('plugin')
+        [plugin] = [
+            plugin for ns, plugin in credential_plugins.items()
+            if ns == self.namespace
+        ]
+        return plugin
 
     def default_for_field(self, field_id):
         for field in self.inputs.get('fields', []):
@@ -584,27 +428,13 @@ class CredentialType(CommonModelNameNotUnique):
             created.save()
 
     @classmethod
-    def from_v1_kind(cls, kind, data={}):
-        match = None
-        kind = kind or 'ssh'
-        kind_choices = dict(V1Credential.KIND_CHOICES)
-        requirements = {}
-        if kind == 'ssh':
-            if data.get('vault_password'):
-                requirements['kind'] = 'vault'
-            else:
-                requirements['kind'] = 'ssh'
-        elif kind in ('net', 'scm', 'insights'):
-            requirements['kind'] = kind
-        elif kind in kind_choices:
-            requirements.update(dict(
-                kind='cloud',
-                name=kind_choices[kind]
-            ))
-        if requirements:
-            requirements['managed_by_tower'] = True
-            match = cls.objects.filter(**requirements)[:1].get()
-        return match
+    def load_plugin(cls, ns, plugin):
+        ManagedCredentialType(
+            namespace=ns,
+            name=plugin.name,
+            kind='external',
+            inputs=plugin.inputs
+        )
 
     def inject_credential(self, credential, env, safe_env, args, private_data_dir):
         """
@@ -632,9 +462,11 @@ class CredentialType(CommonModelNameNotUnique):
                                  files)
         """
         if not self.injectors:
-            if self.managed_by_tower and credential.kind in dir(builtin_injectors):
+            if self.managed_by_tower and credential.credential_type.namespace in dir(builtin_injectors):
                 injected_env = {}
-                getattr(builtin_injectors, credential.kind)(credential, injected_env, private_data_dir)
+                getattr(builtin_injectors, credential.credential_type.namespace)(
+                    credential, injected_env, private_data_dir
+                )
                 env.update(injected_env)
                 safe_env.update(build_safe_env(injected_env))
             return
@@ -653,14 +485,14 @@ class CredentialType(CommonModelNameNotUnique):
         # build a normal namespace with secret values decrypted (for
         # ansible-playbook) and a safe namespace with secret values hidden (for
         # DB storage)
-        for field_name, value in credential.inputs.items():
+        injectable_fields = list(credential.inputs.keys()) + credential.dynamic_input_fields
+        for field_name in list(set(injectable_fields)):
+            value = credential.get_input(field_name)
 
             if type(value) is bool:
-                # boolean values can't be secret/encrypted
+                # boolean values can't be secret/encrypted/external
                 safe_namespace[field_name] = namespace[field_name] = value
                 continue
-
-            value = credential.get_input(field_name)
 
             if field_name in self.secret_fields:
                 safe_namespace[field_name] = '**********'
@@ -774,6 +606,12 @@ ManagedCredentialType(
             'format': 'ssh_private_key',
             'secret': True,
             'multiline': True
+        }, {
+            'id': 'ssh_public_key_data',
+            'label': ugettext_noop('Signed SSH Certificate'),
+            'type': 'string',
+            'multiline': True,
+            'secret': True,
         }, {
             'id': 'ssh_key_unlock',
             'label': ugettext_noop('Private Key Passphrase'),
@@ -1253,3 +1091,71 @@ ManagedCredentialType(
         }
     },
 )
+
+
+class CredentialInputSource(PrimordialModel):
+
+    class Meta:
+        app_label = 'main'
+        unique_together = (('target_credential', 'input_field_name'),)
+        ordering = ('target_credential', 'source_credential', 'input_field_name',)
+
+    target_credential = models.ForeignKey(
+        'Credential',
+        related_name='input_sources',
+        on_delete=models.CASCADE,
+        null=True,
+    )
+    source_credential = models.ForeignKey(
+        'Credential',
+        related_name='target_input_sources',
+        on_delete=models.CASCADE,
+        null=True,
+    )
+    input_field_name = models.CharField(
+        max_length=1024,
+    )
+    metadata = DynamicCredentialInputField(
+        blank=True,
+        default={}
+    )
+
+    def clean_target_credential(self):
+        if self.target_credential.credential_type.kind == 'external':
+            raise ValidationError(_('Target must be a non-external credential'))
+        return self.target_credential
+
+    def clean_source_credential(self):
+        if self.source_credential.credential_type.kind != 'external':
+            raise ValidationError(_('Source must be an external credential'))
+        return self.source_credential
+
+    def clean_input_field_name(self):
+        defined_fields = self.target_credential.credential_type.defined_fields
+        if self.input_field_name not in defined_fields:
+            raise ValidationError(_(
+                'Input field must be defined on target credential (options are {}).'.format(
+                    ', '.join(sorted(defined_fields))
+                )
+            ))
+        return self.input_field_name
+
+    def get_input_value(self):
+        backend = self.source_credential.credential_type.plugin.backend
+        backend_kwargs = {}
+        for field_name, value in self.source_credential.inputs.items():
+            if field_name in self.source_credential.credential_type.secret_fields:
+                backend_kwargs[field_name] = decrypt_field(self.source_credential, field_name)
+            else:
+                backend_kwargs[field_name] = value
+
+        backend_kwargs.update(self.metadata)
+        return backend(**backend_kwargs)
+
+    def get_absolute_url(self, request=None):
+        view_name = 'api:credential_input_source_detail'
+        return reverse(view_name, kwargs={'pk': self.pk}, request=request)
+
+
+for ns, plugin in credential_plugins.items():
+    CredentialType.load_plugin(ns, plugin)

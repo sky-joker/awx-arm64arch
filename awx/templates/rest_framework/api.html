@@ -1,5 +1,5 @@
 {% extends 'rest_framework/base.html' %}
-{% load i18n staticfiles %}
+{% load i18n static %}
 
 {% block title %}{{ name }} &middot; {% trans 'AWX REST API' %}{% endblock %}
 
@@ -48,6 +48,15 @@
   </div>
 {% endblock %}
 
+{% block content %}
+  {% if deprecated %}
+    <div class="breadcrumb" style="background: #FCC;">
+        <b>This resource has been deprecated and will be removed in a future release.</b>
+    </div>
+  {% endif %}
+{{ block.super }}
+{% endblock content %}
+
 {% block script %}
 <div id="footer">
   <div class="container">
@@ -55,7 +64,7 @@
       <div class="col-sm-6">
       </div>
       <div class="col-sm-6 footer-copyright">
-        Copyright &copy; 2017 <a href="http://www.redhat.com" target="_blank">Red Hat</a>, Inc. All Rights Reserved.
+        Copyright &copy; 2019 <a href="http://www.redhat.com" target="_blank">Red Hat</a>, Inc. All Rights Reserved.
       </div>
     </div>
   </div>

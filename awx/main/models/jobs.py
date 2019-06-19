@@ -18,7 +18,7 @@ from django.db import models
 from django.utils.encoding import smart_str
 from django.utils.timezone import now
 from django.utils.translation import ugettext_lazy as _
-from django.core.exceptions import ValidationError, FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist
 
 # REST Framework
 from rest_framework.exceptions import ParseError
@@ -152,21 +152,9 @@ class JobOptions(BaseModel):
 
     extra_vars_dict = VarsDictProperty('extra_vars', True)
 
-    def clean_credential(self):
-        cred = self.credential
-        if cred and cred.kind != 'ssh':
-            raise ValidationError(
-                _('You must provide an SSH credential.'),
-            )
-        return cred
-
-    def clean_vault_credential(self):
-        cred = self.vault_credential
-        if cred and cred.kind != 'vault':
-            raise ValidationError(
-                _('You must provide a Vault credential.'),
-            )
-        return cred
+    @property
+    def machine_credential(self):
+        return self.credentials.filter(credential_type__kind='ssh').first()
 
     @property
     def network_credentials(self):
@@ -179,41 +167,6 @@ class JobOptions(BaseModel):
     @property
     def vault_credentials(self):
         return list(self.credentials.filter(credential_type__kind='vault'))
-
-    @property
-    def credential(self):
-        cred = self.get_deprecated_credential('ssh')
-        if cred is not None:
-            return cred.pk
-
-    @property
-    def vault_credential(self):
-        cred = self.get_deprecated_credential('vault')
-        if cred is not None:
-            return cred.pk
-
-    def get_deprecated_credential(self, kind):
-        for cred in self.credentials.all():
-            if cred.credential_type.kind == kind:
-                return cred
-        else:
-            return None
-
-    # TODO: remove when API v1 is removed
-    @property
-    def cloud_credential(self):
-        try:
-            return self.cloud_credentials[-1].pk
-        except IndexError:
-            return None
-
-    # TODO: remove when API v1 is removed
-    @property
-    def network_credential(self):
-        try:
-            return self.network_credentials[-1].pk
-        except IndexError:
-            return None
 
     @property
     def passwords_needed_to_start(self):
@@ -332,9 +285,19 @@ class JobTemplate(UnifiedJobTemplate, JobOptions, SurveyJobTemplateMixin, Resour
         '''
         return self.create_unified_job(**kwargs)
 
+    def get_effective_slice_ct(self, kwargs):
+        actual_inventory = self.inventory
+        if self.ask_inventory_on_launch and 'inventory' in kwargs:
+            actual_inventory = kwargs['inventory']
+        if actual_inventory:
+            return min(self.job_slice_count, actual_inventory.hosts.count())
+        else:
+            return self.job_slice_count
+
     def create_unified_job(self, **kwargs):
         prevent_slicing = kwargs.pop('_prevent_slicing', False)
-        slice_event = bool(self.job_slice_count > 1 and (not prevent_slicing))
+        slice_ct = self.get_effective_slice_ct(kwargs)
+        slice_event = bool(slice_ct > 1 and (not prevent_slicing))
         if slice_event:
             # A Slice Job Template will generate a WorkflowJob rather than a Job
             from awx.main.models.workflow import WorkflowJobTemplate, WorkflowJobNode
@@ -342,18 +305,16 @@ class JobTemplate(UnifiedJobTemplate, JobOptions, SurveyJobTemplateMixin, Resour
             kwargs['_parent_field_name'] = "job_template"
             kwargs.setdefault('_eager_fields', {})
             kwargs['_eager_fields']['is_sliced_job'] = True
+        elif self.job_slice_count > 1 and (not prevent_slicing):
+            # Unique case where JT was set to slice but hosts not available
+            kwargs.setdefault('_eager_fields', {})
+            kwargs['_eager_fields']['job_slice_count'] = 1
         elif prevent_slicing:
             kwargs.setdefault('_eager_fields', {})
             kwargs['_eager_fields'].setdefault('job_slice_count', 1)
         job = super(JobTemplate, self).create_unified_job(**kwargs)
         if slice_event:
-            try:
-                wj_config = job.launch_config
-            except JobLaunchConfig.DoesNotExist:
-                wj_config = JobLaunchConfig()
-            actual_inventory = wj_config.inventory if wj_config.inventory else self.inventory
-            for idx in range(min(self.job_slice_count,
-                                 actual_inventory.hosts.count())):
+            for idx in range(slice_ct):
                 create_kwargs = dict(workflow_job=job,
                                      unified_job_template=self,
                                      ancestor_artifacts=dict(job_slice=idx + 1))
@@ -474,19 +435,21 @@ class JobTemplate(UnifiedJobTemplate, JobOptions, SurveyJobTemplateMixin, Resour
         base_notification_templates = NotificationTemplate.objects
         error_notification_templates = list(base_notification_templates.filter(
             unifiedjobtemplate_notification_templates_for_errors__in=[self, self.project]))
+        started_notification_templates = list(base_notification_templates.filter(
+            unifiedjobtemplate_notification_templates_for_started__in=[self, self.project]))
         success_notification_templates = list(base_notification_templates.filter(
             unifiedjobtemplate_notification_templates_for_success__in=[self, self.project]))
-        any_notification_templates = list(base_notification_templates.filter(
-            unifiedjobtemplate_notification_templates_for_any__in=[self, self.project]))
         # Get Organization NotificationTemplates
         if self.project is not None and self.project.organization is not None:
             error_notification_templates = set(error_notification_templates + list(base_notification_templates.filter(
                 organization_notification_templates_for_errors=self.project.organization)))
+            started_notification_templates = set(started_notification_templates + list(base_notification_templates.filter(
+                organization_notification_templates_for_started=self.project.organization)))
             success_notification_templates = set(success_notification_templates + list(base_notification_templates.filter(
                 organization_notification_templates_for_success=self.project.organization)))
-            any_notification_templates = set(any_notification_templates + list(base_notification_templates.filter(
-                organization_notification_templates_for_any=self.project.organization)))
-        return dict(error=list(error_notification_templates), success=list(success_notification_templates), any=list(any_notification_templates))
+        return dict(error=list(error_notification_templates),
+                    started=list(started_notification_templates),
+                    success=list(success_notification_templates))
 
     '''
     RelatedJobsMixin
@@ -605,60 +568,6 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
         new_prompts['_eager_fields']['job_slice_count'] = self.job_slice_count
         return super(Job, self).copy_unified_job(**new_prompts)
 
-    @property
-    def ask_diff_mode_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_diff_mode_on_launch
-        return False
-
-    @property
-    def ask_variables_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_variables_on_launch
-        return False
-
-    @property
-    def ask_limit_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_limit_on_launch
-        return False
-
-    @property
-    def ask_tags_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_tags_on_launch
-        return False
-
-    @property
-    def ask_skip_tags_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_skip_tags_on_launch
-        return False
-
-    @property
-    def ask_job_type_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_job_type_on_launch
-        return False
-
-    @property
-    def ask_verbosity_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_verbosity_on_launch
-        return False
-
-    @property
-    def ask_inventory_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_inventory_on_launch
-        return False
-
-    @property
-    def ask_credential_on_launch(self):
-        if self.job_template is not None:
-            return self.job_template.ask_credential_on_launch
-        return False
-
     def get_passwords_needed_to_start(self):
         return self.passwords_needed_to_start
 
@@ -753,7 +662,7 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
         data.update(dict(inventory=self.inventory.name if self.inventory else None,
                          project=self.project.name if self.project else None,
                          playbook=self.playbook,
-                         credential=getattr(self.get_deprecated_credential('ssh'), 'name', None),
+                         credential=getattr(self.machine_credential, 'name', None),
                          limit=self.limit,
                          extra_vars=self.display_extra_vars(),
                          hosts=all_hosts))
@@ -861,8 +770,21 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
                             continue
                         host.ansible_facts = ansible_facts
                         host.ansible_facts_modified = now()
-                        if 'insights' in ansible_facts and 'system_id' in ansible_facts['insights']:
-                            host.insights_system_id = ansible_facts['insights']['system_id']
+                        ansible_local_system_id = ansible_facts.get('ansible_local', {}).get('insights', {}).get('system_id', None)
+                        ansible_facts_system_id = ansible_facts.get('insights', {}).get('system_id', None)
+                        if ansible_local_system_id:
+                            print("Setting local {}".format(ansible_local_system_id))
+                            logger.debug("Insights system_id {} found for host <{}, {}> in"
+                                         " ansible local facts".format(ansible_local_system_id,
+                                                                       host.inventory.id,
+                                                                       host.name))
+                            host.insights_system_id = ansible_local_system_id
+                        elif ansible_facts_system_id:
+                            logger.debug("Insights system_id {} found for host <{}, {}> in"
+                                         " insights facts".format(ansible_local_system_id,
+                                                                  host.inventory.id,
+                                                                  host.name))
+                            host.insights_system_id = ansible_facts_system_id
                         host.save()
                         system_tracking_logger.info(
                             'New fact for inventory {} host {}'.format(
@@ -1172,7 +1094,8 @@ class SystemJobOptions(BaseModel):
     SYSTEM_JOB_TYPE = [
         ('cleanup_jobs', _('Remove jobs older than a certain number of days')),
         ('cleanup_activitystream', _('Remove activity stream entries older than a certain number of days')),
-        ('cleanup_facts', _('Purge and/or reduce the granularity of system tracking data')),
+        ('clearsessions', _('Removes expired browser sessions from the database')),
+        ('cleartokens', _('Removes expired OAuth 2 access tokens and refresh tokens'))
     ]
 
     class Meta:
@@ -1212,13 +1135,13 @@ class SystemJobTemplate(UnifiedJobTemplate, SystemJobOptions):
         base_notification_templates = NotificationTemplate.objects.all()
         error_notification_templates = list(base_notification_templates
                                             .filter(unifiedjobtemplate_notification_templates_for_errors__in=[self]))
+        started_notification_templates = list(base_notification_templates
+                                              .filter(unifiedjobtemplate_notification_templates_for_started__in=[self]))
         success_notification_templates = list(base_notification_templates
                                               .filter(unifiedjobtemplate_notification_templates_for_success__in=[self]))
-        any_notification_templates = list(base_notification_templates
-                                          .filter(unifiedjobtemplate_notification_templates_for_any__in=[self]))
         return dict(error=list(error_notification_templates),
-                    success=list(success_notification_templates),
-                    any=list(any_notification_templates))
+                    started=list(started_notification_templates),
+                    success=list(success_notification_templates))
 
     def _accept_or_ignore_job_kwargs(self, _exclude_errors=None, **kwargs):
         extra_data = kwargs.pop('extra_vars', {})

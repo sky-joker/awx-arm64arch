@@ -5,3 +5,4 @@ pytest-runner
 isort
 virtualenv
 m2r
+wheel

@@ -75,10 +75,15 @@ GLqbpJyX2r3p/Rmo6mLY71SqpA==
 @pytest.mark.django_db
 def test_default_cred_types():
     assert sorted(CredentialType.defaults.keys()) == [
+        'aim',
         'aws',
+        'azure_kv',
         'azure_rm',
         'cloudforms',
+        'conjur',
         'gce',
+        'hashivault_kv',
+        'hashivault_ssh',
         'insights',
         'net',
         'openstack',
@@ -92,25 +97,6 @@ def test_default_cred_types():
     ]
     for type_ in CredentialType.defaults.values():
         assert type_().managed_by_tower is True
-
-
-@pytest.mark.django_db
-@pytest.mark.parametrize('kind', ['net', 'scm', 'ssh', 'vault'])
-def test_cred_type_kind_uniqueness(kind):
-    """
-    non-cloud credential types are exclusive_on_kind (you can only use *one* of
-    them at a time)
-    """
-    assert CredentialType.defaults[kind]().unique_by_kind is True
-
-
-@pytest.mark.django_db
-def test_cloud_kind_uniqueness():
-    """
-    you can specify more than one cloud credential type (as long as they have
-    different names so you don't e.g., use ec2 twice")
-    """
-    assert CredentialType.defaults['aws']().unique_by_kind is False
 
 
 @pytest.mark.django_db
@@ -136,7 +122,7 @@ def test_credential_creation(organization_factory):
     cred.full_clean()
     assert isinstance(cred, Credential)
     assert cred.name == "Bob's Credential"
-    assert cred.inputs['username'] == cred.username == 'bob'
+    assert cred.inputs['username'] == 'bob'
 
 
 @pytest.mark.django_db
@@ -181,7 +167,7 @@ def test_ssh_key_data_validation(organization, kind, ssh_key_data, ssh_key_unloc
 @pytest.mark.django_db
 @pytest.mark.parametrize('inputs, valid', [
     ({'vault_password': 'some-pass'}, True),
-    ({}, False),
+    ({}, True),
     ({'vault_password': 'dev-pass', 'vault_id': 'dev'}, True),
     ({'vault_password': 'dev-pass', 'vault_id': 'dev@prompt'}, False),  # @ not allowed
 ])

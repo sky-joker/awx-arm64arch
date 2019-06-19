@@ -28,7 +28,7 @@ def test_basic_parameterization(get, post, user, organization):
                          description="test webhook",
                          organization=organization.id,
                          notification_type="webhook",
-                         notification_configuration=dict(url="http://localhost",
+                         notification_configuration=dict(url="http://localhost", disable_ssl_verification=False,
                                                          headers={"Test": "Header"})),
                     u)
     assert response.status_code == 201
@@ -81,7 +81,7 @@ def test_inherited_notification_templates(get, post, user, organization, project
                              description="test webhook {}".format(nfiers),
                              organization=organization.id,
                              notification_type="webhook",
-                             notification_configuration=dict(url="http://localhost",
+                             notification_configuration=dict(url="http://localhost", disable_ssl_verification=False,
                                                              headers={"Test": "Header"})),
                         u)
         assert response.status_code == 201
@@ -92,27 +92,7 @@ def test_inherited_notification_templates(get, post, user, organization, project
     isrc.save()
     jt = JobTemplate.objects.create(name='test', inventory=i, project=project, playbook='debug.yml')
     jt.save()
-    url = reverse('api:organization_notification_templates_any_list', kwargs={'pk': organization.id})
-    response = post(url, dict(id=notification_templates[0]), u)
-    assert response.status_code == 204
-    url = reverse('api:project_notification_templates_any_list', kwargs={'pk': project.id})
-    response = post(url, dict(id=notification_templates[1]), u)
-    assert response.status_code == 204
-    url = reverse('api:job_template_notification_templates_any_list', kwargs={'pk': jt.id})
-    response = post(url, dict(id=notification_templates[2]), u)
-    assert response.status_code == 204
-    assert len(jt.notification_templates['any']) == 3
-    assert len(project.notification_templates['any']) == 2
-    assert len(isrc.notification_templates['any']) == 1
-
-
-@pytest.mark.django_db
-def test_notification_template_merging(get, post, user, organization, project, notification_template):
-    user('admin-poster', True)
-    organization.notification_templates_any.add(notification_template)
-    project.notification_templates_any.add(notification_template)
-    assert len(project.notification_templates['any']) == 1
-
+    
 
 @pytest.mark.django_db
 def test_notification_template_simple_patch(patch, notification_template, admin):
@@ -143,7 +123,7 @@ def test_custom_environment_injection(post, user, organization):
                          description="test webhook",
                          organization=organization.id,
                          notification_type="webhook",
-                         notification_configuration=dict(url="https://example.org",
+                         notification_configuration=dict(url="https://example.org", disable_ssl_verification=False,
                                                          headers={"Test": "Header"})),
                     u)
     assert response.status_code == 201

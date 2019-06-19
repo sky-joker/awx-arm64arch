@@ -2,7 +2,7 @@
 # All Rights Reserved.
 
 from django.conf import settings
-from django.core.urlresolvers import NoReverseMatch
+from django.urls import NoReverseMatch
 
 from rest_framework.reverse import _reverse
 from rest_framework.versioning import URLPathVersioning as BaseVersioning
@@ -25,19 +25,6 @@ def drf_reverse(viewname, args=None, kwargs=None, request=None, format=None, **e
         url = _reverse(viewname, args, kwargs, request, format, **extra)
 
     return url
-
-
-def get_request_version(request):
-    """
-    The API version of a request as an integer i.e., 1 or 2
-    """
-    version = settings.REST_FRAMEWORK['DEFAULT_VERSION']
-    if request and hasattr(request, 'version'):
-        version = request.version
-        if version is None:
-            # For requests to /api/
-            return None
-    return int(version.lstrip('v'))
 
 
 def reverse(viewname, args=None, kwargs=None, request=None, format=None, **extra):

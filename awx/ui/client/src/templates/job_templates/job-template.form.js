@@ -149,7 +149,7 @@ function(NotificationsList, i18n) {
                     dataTitle: i18n._('Forks'),
                     dataPlacement: 'right',
                     dataContainer: 'body',
-                    awPopOver: "<p>" + i18n._("The number of parallel or simultaneous processes to use while executing the playbook. Value defaults to 0. Refer to the Ansible documentation for details about the configuration file.") + "</p>",
+                    awPopOver: "<p>" + i18n._("The number of parallel or simultaneous processes to use while executing the playbook. An empty value, or a value less than 1 will use the Ansible default which is usually 5. The default number of forks can be overwritten with a change to ") + "<code class='popover-body_code-snippet'>ansible.cfg</code>. " + i18n._("Refer to the Ansible documentation for details about the configuration file.") + "</p>",
                     ngDisabled: '!(job_template_obj.summary_fields.user_capabilities.edit || canAddJobTemplate)'
                 },
                 limit: {
@@ -393,6 +393,13 @@ function(NotificationsList, i18n) {
             },
 
             buttons: { //for now always generates <button> tags
+                launch: {
+                    component: 'at-launch-template',
+                    templateObj: 'job_template_obj',
+                    ngShow: '(job_template_obj.summary_fields.user_capabilities.start || canAddJobTemplate)',
+                    ngDisabled: 'disableLaunch || job_template_form.$dirty',
+                    showTextButton: 'true'
+                },
                 cancel: {
                     ngClick: 'formCancel()',
                     ngShow: '(job_template_obj.summary_fields.user_capabilities.edit || canAddJobTemplate)'
@@ -405,13 +412,6 @@ function(NotificationsList, i18n) {
                     ngClick: 'formSave()',    //$scope.function to call on click, optional
                     ngDisabled: "job_template_form.$invalid",//true          //Disable when $pristine or $invalid, optional and when can_edit = false, for permission reasons
                     ngShow: '(job_template_obj.summary_fields.user_capabilities.edit || canAddJobTemplate)'
-                },
-                launch: {
-                    component: 'at-launch-template',
-                    templateObj: 'job_template_obj',
-                    ngShow: '(job_template_obj.summary_fields.user_capabilities.start || canAddJobTemplate)',
-                    ngDisabled: 'disableLaunch || job_template_form.$dirty',
-                    showTextButton: 'true'
                 }
             },
 
@@ -480,7 +480,6 @@ function(NotificationsList, i18n) {
             relatedButtons: {
                 view_survey: {
                     ngClick: 'editSurvey()',
-                    awFeature: 'surveys',
                     ngShow: '($state.is(\'templates.addJobTemplate\') || $state.is(\'templates.editJobTemplate\')) &&  survey_exists && !(job_template_obj.summary_fields.user_capabilities.edit || canAddJobTemplate)',
                     label: i18n._('View Survey'),
                     class: 'Form-primaryButton'
@@ -488,7 +487,6 @@ function(NotificationsList, i18n) {
                 add_survey: {
                     ngClick: 'addSurvey()',
                     ngShow: '($state.is(\'templates.addJobTemplate\') || $state.is(\'templates.editJobTemplate\')) && !survey_exists && (job_template_obj.summary_fields.user_capabilities.edit || canAddJobTemplate)',
-                    awFeature: 'surveys',
                     awToolTip: '{{surveyTooltip}}',
                     dataPlacement: 'top',
                     label: i18n._('Add Survey'),
@@ -496,7 +494,6 @@ function(NotificationsList, i18n) {
                 },
                 edit_survey: {
                     ngClick: 'editSurvey()',
-                    awFeature: 'surveys',
                     ngShow: '($state.is(\'templates.addJobTemplate\') || $state.is(\'templates.editJobTemplate\')) && survey_exists && (job_template_obj.summary_fields.user_capabilities.edit || canAddJobTemplate)',
                     label: i18n._('Edit Survey'),
                     class: 'Form-primaryButton',
