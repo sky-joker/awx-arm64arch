@@ -34,7 +34,7 @@ from rest_framework.negotiation import DefaultContentNegotiation
 # AWX
 from awx.api.filters import FieldLookupBackend
 from awx.main.models import (
-    UnifiedJob, UnifiedJobTemplate, User, Role
+    UnifiedJob, UnifiedJobTemplate, User, Role, Credential
 )
 from awx.main.access import access_registry
 from awx.main.utils import (
@@ -46,7 +46,7 @@ from awx.main.utils import (
 )
 from awx.main.utils.db import get_all_field_names
 from awx.api.serializers import ResourceAccessListElementSerializer, CopySerializer, UserSerializer
-from awx.api.versioning import URLPathVersioning, get_request_version
+from awx.api.versioning import URLPathVersioning
 from awx.api.metadata import SublistAttachDetatchMetadata, Metadata
 
 __all__ = ['APIView', 'GenericAPIView', 'ListAPIView', 'SimpleListAPIView',
@@ -119,39 +119,12 @@ class LoggedLogoutView(auth_views.LogoutView):
         return ret
 
 
-def get_view_name(cls, suffix=None):
-    '''
-    Wrapper around REST framework get_view_name() to support get_name() method
-    and view_name property on a view class.
-    '''
-    name = ''
-    if hasattr(cls, 'get_name') and callable(cls.get_name):
-        name = cls().get_name()
-    elif hasattr(cls, 'view_name'):
-        if callable(cls.view_name):
-            name = cls.view_name()
-        else:
-            name = cls.view_name
-    if name:
-        return ('%s %s' % (name, suffix)) if suffix else name
-    return views.get_view_name(cls, suffix=None)
+def get_view_description(view, html=False):
+    '''Wrapper around REST framework get_view_description() to continue
+    to support our historical div.
 
-
-def get_view_description(cls, request, html=False):
     '''
-    Wrapper around REST framework get_view_description() to support
-    get_description() method and view_description property on a view class.
-    '''
-    if hasattr(cls, 'get_description') and callable(cls.get_description):
-        desc = cls().get_description(request, html=html)
-        cls = type(cls.__name__, (object,), {'__doc__': desc})
-    elif hasattr(cls, 'view_description'):
-        if callable(cls.view_description):
-            view_desc = cls.view_description()
-        else:
-            view_desc = cls.view_description
-        cls = type(cls.__name__, (object,), {'__doc__': view_desc})
-    desc = views.get_view_description(cls, html=html)
+    desc = views.get_view_description(view, html=html)
     if html:
         desc = '<div class="description">%s</div>' % desc
     return mark_safe(desc)
@@ -264,14 +237,6 @@ class APIView(views.APIView):
         # `curl https://user:pass@tower.example.org/api/v2/job_templates/N/launch/`
         return 'Bearer realm=api authorization_url=/api/o/authorize/'
 
-    def get_view_description(self, html=False):
-        """
-        Return some descriptive text for the view, as used in OPTIONS responses
-        and in the browsable API.
-        """
-        func = self.settings.VIEW_DESCRIPTION_FUNCTION
-        return func(self.__class__, getattr(self, '_request', None), html)
-
     def get_description_context(self):
         return {
             'view': self,
@@ -280,19 +245,13 @@ class APIView(views.APIView):
             'swagger_method': getattr(self.request, 'swagger_method', None),
         }
 
-    def get_description(self, request, html=False):
-        self.request = request
+    @property
+    def description(self):
         template_list = []
         for klass in inspect.getmro(type(self)):
             template_basename = camelcase_to_underscore(klass.__name__)
             template_list.append('api/%s.md' % template_basename)
         context = self.get_description_context()
-
-        # "v2" -> 2
-        default_version = int(settings.REST_FRAMEWORK['DEFAULT_VERSION'].lstrip('v'))
-        request_version = get_request_version(self.request)
-        if request_version is not None and request_version < default_version:
-            context['deprecated'] = True
 
         description = render_to_string(template_list, context)
         if context.get('deprecated') and context.get('swagger_method') is None:
@@ -389,12 +348,14 @@ class GenericAPIView(generics.GenericAPIView, APIView):
                     'model_verbose_name_plural': smart_text(self.model._meta.verbose_name_plural),
                 })
             serializer = self.get_serializer()
+            metadata = self.metadata_class()
+            metadata.request = self.request
             for method, key in [
                 ('GET', 'serializer_fields'),
                 ('POST', 'serializer_create_fields'),
                 ('PUT', 'serializer_update_fields')
             ]:
-                d[key] = self.metadata_class().get_serializer_info(serializer, method=method)
+                d[key] = metadata.get_serializer_info(serializer, method=method)
         d['settings'] = settings
         return d
 
@@ -815,6 +776,7 @@ class RetrieveUpdateDestroyAPIView(RetrieveUpdateAPIView, DestroyAPIView):
 class ResourceAccessList(ParentMixin, ListAPIView):
 
     serializer_class = ResourceAccessListElementSerializer
+    ordering = ('username',)
 
     def get_queryset(self):
         obj = self.get_parent_object()
@@ -841,10 +803,6 @@ class CopyAPIView(GenericAPIView):
     new_in_330 = True
     new_in_api_v2 = True
 
-    def v1_not_allowed(self):
-        return Response({'detail': 'Action only possible starting with v2 API.'},
-                        status=status.HTTP_404_NOT_FOUND)
-
     def _get_copy_return_serializer(self, *args, **kwargs):
         if not self.copy_return_serializer_class:
             return self.get_serializer(*args, **kwargs)
@@ -858,15 +816,15 @@ class CopyAPIView(GenericAPIView):
     def _decrypt_model_field_if_needed(obj, field_name, field_val):
         if field_name in getattr(type(obj), 'REENCRYPTION_BLACKLIST_AT_COPY', []):
             return field_val
-        if isinstance(field_val, dict):
+        if isinstance(obj, Credential) and field_name == 'inputs':
+            for secret in obj.credential_type.secret_fields:
+                if secret in field_val:
+                    field_val[secret] = decrypt_field(obj, secret)
+        elif isinstance(field_val, dict):
             for sub_field in field_val:
                 if isinstance(sub_field, str) \
                         and isinstance(field_val[sub_field], str):
-                    try:
-                        field_val[sub_field] = decrypt_field(obj, field_name, sub_field)
-                    except AttributeError:
-                        # Catching the corner case with v1 credential fields
-                        field_val[sub_field] = decrypt_field(obj, sub_field)
+                    field_val[sub_field] = decrypt_field(obj, field_name, sub_field)
         elif isinstance(field_val, str):
             try:
                 field_val = decrypt_field(obj, field_name)
@@ -951,21 +909,20 @@ class CopyAPIView(GenericAPIView):
         return ret
 
     def get(self, request, *args, **kwargs):
-        if get_request_version(request) < 2:
-            return self.v1_not_allowed()
         obj = self.get_object()
         if not request.user.can_access(obj.__class__, 'read', obj):
             raise PermissionDenied()
         create_kwargs = self._build_create_dict(obj)
         for key in create_kwargs:
             create_kwargs[key] = getattr(create_kwargs[key], 'pk', None) or create_kwargs[key]
-        can_copy = request.user.can_access(self.model, 'add', create_kwargs) and \
-            request.user.can_access(self.model, 'copy_related', obj)
+        try:
+            can_copy = request.user.can_access(self.model, 'add', create_kwargs) and \
+                request.user.can_access(self.model, 'copy_related', obj)
+        except PermissionDenied:
+            return Response({'can_copy': False})
         return Response({'can_copy': can_copy})
 
     def post(self, request, *args, **kwargs):
-        if get_request_version(request) < 2:
-            return self.v1_not_allowed()
         obj = self.get_object()
         create_kwargs = self._build_create_dict(obj)
         create_kwargs_check = {}
@@ -982,7 +939,7 @@ class CopyAPIView(GenericAPIView):
             None, None, self.model, obj, request.user, create_kwargs=create_kwargs,
             copy_name=serializer.validated_data.get('name', '')
         )
-        if hasattr(new_obj, 'admin_role') and request.user not in new_obj.admin_role:
+        if hasattr(new_obj, 'admin_role') and request.user not in new_obj.admin_role.members.all():
             new_obj.admin_role.members.add(request.user)
         if sub_objs:
             permission_check_func = None

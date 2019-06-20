@@ -42,10 +42,6 @@ def test_inventory_source_notification_on_cloud_only(get, post, inventory_source
 
     not_is = inventory_source_factory("not_ec2")
 
-    url = reverse('api:inventory_source_notification_templates_any_list', kwargs={'pk': cloud_is.id})
-    response = post(url, dict(id=notification_template.id), u)
-    assert response.status_code == 204
-
     url = reverse('api:inventory_source_notification_templates_success_list', kwargs={'pk': not_is.id})
     response = post(url, dict(id=notification_template.id), u)
     assert response.status_code == 400
@@ -423,6 +419,22 @@ def test_inventory_source_vars_prohibition(post, inventory, admin_user):
                  admin_user, expect=400)
     assert 'prohibited environment variable' in r.data['source_vars'][0]
     assert 'FOOBAR' in r.data['source_vars'][0]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('role,expect', [
+    ('admin_role', 200),
+    ('use_role', 403),
+    ('adhoc_role', 403),
+    ('read_role', 403)
+])
+def test_action_view_permissions(patch, put, get, inventory, rando, role, expect):
+    getattr(inventory, role).members.add(rando)
+    url = reverse('api:inventory_variable_data', kwargs={'pk': inventory.pk})
+    # read_role and all other roles should be able to view
+    get(url=url, user=rando, expect=200)
+    patch(url=url, data={"host_filter": "bar"}, user=rando, expect=expect)
+    put(url=url, data={"fooooo": "bar"}, user=rando, expect=expect)
 
 
 @pytest.mark.django_db

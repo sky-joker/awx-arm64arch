@@ -5,6 +5,7 @@ import os
 import re  # noqa
 import sys
 from datetime import timedelta
+from celery.schedules import crontab
 
 # global settings
 from django.conf import global_settings
@@ -250,29 +251,11 @@ TEMPLATES = [
     },
 ]
 
-MIDDLEWARE_CLASSES = (  # NOQA
-    'awx.main.middleware.TimingMiddleware',
-    'awx.main.middleware.MigrationRanCheckMiddleware',
-    'corsheaders.middleware.CorsMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.locale.LocaleMiddleware',
-    'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
-    'awx.main.middleware.ActivityStreamMiddleware',
-    'awx.sso.middleware.SocialAuthMiddleware',
-    'crum.CurrentRequestUserMiddleware',
-    'awx.main.middleware.URLModificationMiddleware',
-    'awx.main.middleware.SessionTimeoutMiddleware',
-)
-
-
 ROOT_URLCONF = 'awx.urls'
 
 WSGI_APPLICATION = 'awx.wsgi.application'
 
-INSTALLED_APPS = (
+INSTALLED_APPS = [
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.messages',
@@ -293,7 +276,7 @@ INSTALLED_APPS = (
     'awx.ui',
     'awx.sso',
     'solo'
-)
+]
 
 INTERNAL_IPS = ('127.0.0.1',)
 
@@ -324,7 +307,6 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_METADATA_CLASS': 'awx.api.metadata.Metadata',
     'EXCEPTION_HANDLER': 'awx.api.views.api_exception_handler',
-    'VIEW_NAME_FUNCTION': 'awx.api.generics.get_view_name',
     'VIEW_DESCRIPTION_FUNCTION': 'awx.api.generics.get_view_description',
     'NON_FIELD_ERRORS_KEY': '__all__',
     'DEFAULT_VERSION': 'v2',
@@ -446,17 +428,6 @@ AWX_ISOLATED_VERBOSITY = 0
 #     }
 # }
 
-# Use Django-Debug-Toolbar if installed.
-try:
-    import debug_toolbar
-    INSTALLED_APPS += (debug_toolbar.__name__,)
-except ImportError:
-    pass
-
-DEBUG_TOOLBAR_CONFIG = {
-    'INTERCEPT_REDIRECTS': False,
-    'ENABLE_STACKTRACES' : True,
-}
 
 DEVSERVER_DEFAULT_ADDR = '0.0.0.0'
 DEVSERVER_DEFAULT_PORT = '8013'
@@ -464,6 +435,7 @@ DEVSERVER_DEFAULT_PORT = '8013'
 # Set default ports for live server tests.
 os.environ.setdefault('DJANGO_LIVE_TEST_SERVER_ADDRESS', 'localhost:9013-9199')
 
+BROKER_DURABILITY = True
 BROKER_POOL_LIMIT = None
 BROKER_URL = 'amqp://guest:guest@localhost:5672//'
 CELERY_DEFAULT_QUEUE = 'awx_private_queue'
@@ -486,16 +458,16 @@ CELERYBEAT_SCHEDULE = {
         'task': 'awx.main.tasks.purge_old_stdout_files',
         'schedule': timedelta(days=7)
     },
+    'gather_analytics': {
+        'task': 'awx.main.tasks.gather_analytics',
+        'schedule': crontab(hour=0)
+    },
     'task_manager': {
         'task': 'awx.main.scheduler.tasks.run_task_manager',
         'schedule': timedelta(seconds=20),
         'options': {'expires': 20}
     },
-    'isolated_heartbeat': {
-        'task': 'awx.main.tasks.awx_isolated_heartbeat',
-        'schedule': timedelta(seconds=AWX_ISOLATED_PERIODIC_CHECK),
-        'options': {'expires': AWX_ISOLATED_PERIODIC_CHECK * 2},
-    }
+    # 'isolated_heartbeat': set up at the end of production.py and development.py
 }
 AWX_INCONSISTENT_TASK_INTERVAL = 60 * 3
 
@@ -628,7 +600,7 @@ AWX_REBUILD_SMART_MEMBERSHIP = False
 ALLOW_JINJA_IN_EXTRA_VARS = 'template'
 
 # Enable dynamically pulling roles from a requirement.yml file
-# when updating SCM projects 
+# when updating SCM projects
 # Note: This setting may be overridden by database settings.
 AWX_ROLES_ENABLED = True
 
@@ -666,6 +638,11 @@ AWX_AUTO_DEPROVISION_INSTANCES = False
 # Enable Pendo on the UI, possible values are 'off', 'anonymous', and 'detailed'
 # Note: This setting may be overridden by database settings.
 PENDO_TRACKING_STATE = "off"
+
+# Enables Insights data collection for Ansible Tower.
+# Note: This setting may be overridden by database settings.
+INSIGHTS_TRACKING_STATE = False
+
 
 # Default list of modules allowed for ad hoc commands.
 # Note: This setting may be overridden by database settings.
@@ -808,7 +785,7 @@ GCE_ENABLED_VALUE = 'running'
 GCE_GROUP_FILTER = r'^.+$'
 GCE_HOST_FILTER = r'^.+$'
 GCE_EXCLUDE_EMPTY_GROUPS = True
-GCE_INSTANCE_ID_VAR = None
+GCE_INSTANCE_ID_VAR = 'gce_id'
 
 # --------------------------------------
 # -- Microsoft Azure Resource Manager --
@@ -909,7 +886,7 @@ CLOUDFORMS_INSTANCE_ID_VAR = 'cloudforms.id'
 #CUSTOM_ENABLED_VALUE =
 CUSTOM_GROUP_FILTER = r'^.+$'
 CUSTOM_HOST_FILTER = r'^.+$'
-CUSTOM_EXCLUDE_EMPTY_GROUPS = True
+CUSTOM_EXCLUDE_EMPTY_GROUPS = False
 #CUSTOM_INSTANCE_ID_VAR =
 
 # ---------------------
@@ -919,7 +896,7 @@ CUSTOM_EXCLUDE_EMPTY_GROUPS = True
 #SCM_ENABLED_VALUE =
 SCM_GROUP_FILTER = r'^.+$'
 SCM_HOST_FILTER = r'^.+$'
-SCM_EXCLUDE_EMPTY_GROUPS = True
+SCM_EXCLUDE_EMPTY_GROUPS = False
 #SCM_INSTANCE_ID_VAR =
 
 # ---------------------
@@ -936,7 +913,6 @@ INTERNAL_API_URL = 'http://127.0.0.1:%s' % DEVSERVER_DEFAULT_PORT
 PERSISTENT_CALLBACK_MESSAGES = True
 USE_CALLBACK_QUEUE = True
 CALLBACK_QUEUE = "callback_tasks"
-FACT_QUEUE = "facts"
 
 SCHEDULER_QUEUE = "scheduler"
 
@@ -958,6 +934,7 @@ TOWER_ADMIN_ALERTS = True
 TOWER_URL_BASE = "https://towerhost"
 
 INSIGHTS_URL_BASE = "https://example.org"
+INSIGHTS_AGENT_MIME = 'application/example'
 
 TOWER_SETTINGS_MANIFEST = {}
 
@@ -989,6 +966,9 @@ LOGGING = {
         'external_log_enabled': {
             '()': 'awx.main.utils.filters.ExternalLoggerEnabled'
         },
+        'dynamic_level_filter': {
+            '()': 'awx.main.utils.filters.DynamicLevelFilter'
+        }
     },
     'formatters': {
         'simple': {
@@ -1028,7 +1008,7 @@ LOGGING = {
         'external_logger': {
             'class': 'awx.main.utils.handlers.AWXProxyHandler',
             'formatter': 'json',
-            'filters': ['external_log_enabled'],
+            'filters': ['external_log_enabled', 'dynamic_level_filter'],
         },
         'mail_admins': {
             'level': 'ERROR',
@@ -1036,27 +1016,27 @@ LOGGING = {
             'class': 'django.utils.log.AdminEmailHandler',
         },
         'tower_warnings': {
-            'level': 'WARNING',
-            'class':'logging.handlers.RotatingFileHandler',
-            'filters': ['require_debug_false'],
+            # don't define a level here, it's set by settings.LOG_AGGREGATOR_LEVEL
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filters': ['require_debug_false', 'dynamic_level_filter'],
             'filename': os.path.join(LOG_ROOT, 'tower.log'),
             'maxBytes': 1024 * 1024 * 5, # 5 MB
             'backupCount': 5,
             'formatter':'simple',
         },
         'callback_receiver': {
-            'level': 'WARNING',
-            'class':'logging.handlers.RotatingFileHandler',
-            'filters': ['require_debug_false'],
+            # don't define a level here, it's set by settings.LOG_AGGREGATOR_LEVEL
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filters': ['require_debug_false', 'dynamic_level_filter'],
             'filename': os.path.join(LOG_ROOT, 'callback_receiver.log'),
             'maxBytes': 1024 * 1024 * 5, # 5 MB
             'backupCount': 5,
             'formatter':'simple',
         },
         'dispatcher': {
-            'level': 'WARNING',
-            'class':'logging.handlers.RotatingFileHandler',
-            'filters': ['require_debug_false'],
+            # don't define a level here, it's set by settings.LOG_AGGREGATOR_LEVEL
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filters': ['require_debug_false', 'dynamic_level_filter'],
             'filename': os.path.join(LOG_ROOT, 'dispatcher.log'),
             'maxBytes': 1024 * 1024 * 5, # 5 MB
             'backupCount': 5,
@@ -1072,9 +1052,9 @@ LOGGING = {
             'formatter': 'timed_import',
         },
         'task_system': {
-            'level': 'INFO',
-            'class':'logging.handlers.RotatingFileHandler',
-            'filters': ['require_debug_false'],
+            # don't define a level here, it's set by settings.LOG_AGGREGATOR_LEVEL
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filters': ['require_debug_false', 'dynamic_level_filter'],
             'filename': os.path.join(LOG_ROOT, 'task_system.log'),
             'maxBytes': 1024 * 1024 * 5, # 5 MB
             'backupCount': 5,
@@ -1085,15 +1065,6 @@ LOGGING = {
             'class':'logging.handlers.RotatingFileHandler',
             'filters': ['require_debug_false'],
             'filename': os.path.join(LOG_ROOT, 'management_playbooks.log'),
-            'maxBytes': 1024 * 1024 * 5, # 5 MB
-            'backupCount': 5,
-            'formatter':'simple',
-        },
-        'fact_receiver': {
-            'level': 'WARNING',
-            'class':'logging.handlers.RotatingFileHandler',
-            'filters': ['require_debug_false'],
-            'filename': os.path.join(LOG_ROOT, 'fact_receiver.log'),
             'maxBytes': 1024 * 1024 * 5, # 5 MB
             'backupCount': 5,
             'formatter':'simple',
@@ -1215,3 +1186,20 @@ AWX_REQUEST_PROFILE = False
 
 # Delete temporary directories created to store playbook run-time
 AWX_CLEANUP_PATHS = True
+
+MIDDLEWARE = [
+    'awx.main.middleware.TimingMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'awx.main.middleware.MigrationRanCheckMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.locale.LocaleMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'awx.main.middleware.ActivityStreamMiddleware',
+    'awx.sso.middleware.SocialAuthMiddleware',
+    'crum.CurrentRequestUserMiddleware',
+    'awx.main.middleware.URLModificationMiddleware',
+    'awx.main.middleware.SessionTimeoutMiddleware',
+]

@@ -108,7 +108,7 @@ class TaskManager():
             dag = WorkflowDAG(workflow_job)
             spawn_nodes = dag.bfs_nodes_to_run()
             if spawn_nodes:
-                logger.info('Spawning jobs for %s', workflow_job.log_format)
+                logger.debug('Spawning jobs for %s', workflow_job.log_format)
             else:
                 logger.debug('No nodes to spawn for %s', workflow_job.log_format)
             for spawn_node in spawn_nodes:
@@ -118,7 +118,7 @@ class TaskManager():
                 job = spawn_node.unified_job_template.create_unified_job(**kv)
                 spawn_node.job = job
                 spawn_node.save()
-                logger.info('Spawned %s in %s for node %s', job.log_format, workflow_job.log_format, spawn_node.pk)
+                logger.debug('Spawned %s in %s for node %s', job.log_format, workflow_job.log_format, spawn_node.pk)
                 can_start = True
                 if isinstance(spawn_node.unified_job_template, WorkflowJobTemplate):
                     workflow_ancestors = job.get_ancestor_workflows()
@@ -178,7 +178,7 @@ class TaskManager():
                 if not is_done:
                     continue
                 has_failed, reason = dag.has_workflow_failed()
-                logger.info('Marking %s as %s.', workflow_job.log_format, 'failed' if has_failed else 'successful')
+                logger.debug('Marking %s as %s.', workflow_job.log_format, 'failed' if has_failed else 'successful')
                 result.append(workflow_job.id)
                 new_status = 'failed' if has_failed else 'successful'
                 logger.debug("Transitioning {} to {} status.".format(workflow_job.log_format, new_status))
@@ -193,6 +193,8 @@ class TaskManager():
                 status_changed = True
             if status_changed:
                 workflow_job.websocket_emit_status(workflow_job.status)
+                # Operations whose queries rely on modifications made during the atomic scheduling session
+                workflow_job.send_notification_templates('succeeded' if workflow_job.status == 'successful' else 'failed')
                 if workflow_job.spawned_by_workflow:
                     schedule_task_manager()
         return result
@@ -233,26 +235,27 @@ class TaskManager():
         else:
             if type(task) is WorkflowJob:
                 task.status = 'running'
-                logger.info('Transitioning %s to running status.', task.log_format)
+                task.send_notification_templates('running')
+                logger.debug('Transitioning %s to running status.', task.log_format)
                 schedule_task_manager()
             elif not task.supports_isolation() and rampart_group.controller_id:
                 # non-Ansible jobs on isolated instances run on controller
                 task.instance_group = rampart_group.controller
                 task.execution_node = random.choice(list(rampart_group.controller.instances.all().values_list('hostname', flat=True)))
-                logger.info('Submitting isolated {} to queue {}.'.format(
-                            task.log_format, task.instance_group.name, task.execution_node))
+                logger.debug('Submitting isolated {} to queue {}.'.format(
+                             task.log_format, task.instance_group.name, task.execution_node))
             elif controller_node:
                 task.instance_group = rampart_group
                 task.execution_node = instance.hostname
                 task.controller_node = controller_node
-                logger.info('Submitting isolated {} to queue {} controlled by {}.'.format(
-                            task.log_format, task.execution_node, controller_node))
+                logger.debug('Submitting isolated {} to queue {} controlled by {}.'.format(
+                             task.log_format, task.execution_node, controller_node))
             else:
                 task.instance_group = rampart_group
                 if instance is not None:
                     task.execution_node = instance.hostname
-                logger.info('Submitting {} to <instance group, instance> <{},{}>.'.format(
-                            task.log_format, task.instance_group_id, task.execution_node))
+                logger.debug('Submitting {} to <instance group, instance> <{},{}>.'.format(
+                             task.log_format, task.instance_group_id, task.execution_node))
             with disable_activity_stream():
                 task.celery_task_id = str(uuid.uuid4())
                 task.save()
@@ -295,7 +298,7 @@ class TaskManager():
         project_task.created = task.created - timedelta(seconds=1)
         project_task.status = 'pending'
         project_task.save()
-        logger.info(
+        logger.debug(
             'Spawned {} as dependency of {}'.format(
                 project_task.log_format, task.log_format
             )
@@ -309,7 +312,7 @@ class TaskManager():
         inventory_task.created = task.created - timedelta(seconds=2)
         inventory_task.status = 'pending'
         inventory_task.save()
-        logger.info(
+        logger.debug(
             'Spawned {} as dependency of {}'.format(
                 inventory_task.log_format, task.log_format
             )
@@ -581,10 +584,5 @@ class TaskManager():
                     logger.debug("Not running scheduler, another task holds lock")
                     return
                 logger.debug("Starting Scheduler")
-
                 with task_manager_bulk_reschedule():
-                    finished_wfjs = self._schedule()
-
-                # Operations whose queries rely on modifications made during the atomic scheduling session
-                for wfj in WorkflowJob.objects.filter(id__in=finished_wfjs):
-                    wfj.send_notification_templates('succeeded' if wfj.status == 'successful' else 'failed')
+                    self._schedule()

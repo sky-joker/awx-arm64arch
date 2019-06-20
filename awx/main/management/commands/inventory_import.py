@@ -41,6 +41,7 @@ from awx.main.utils import (
 from awx.main.utils.common import _get_ansible_version
 from awx.main.signals import disable_activity_stream
 from awx.main.constants import STANDARD_INVENTORY_UPDATE_ENV
+from awx.main.utils.pglock import advisory_lock
 
 logger = logging.getLogger('awx.main.commands.inventory_import')
 
@@ -75,12 +76,13 @@ class AnsibleInventoryLoader(object):
         /usr/bin/ansible/ansible-inventory -i hosts --list
     '''
 
-    def __init__(self, source, is_custom=False, venv_path=None):
+    def __init__(self, source, is_custom=False, venv_path=None, verbosity=0):
         self.source = source
         self.source_dir = functioning_dir(self.source)
         self.is_custom = is_custom
         self.tmp_private_dir = None
         self.method = 'ansible-inventory'
+        self.verbosity = verbosity
         if venv_path:
             self.venv_path = venv_path
         else:
@@ -134,8 +136,14 @@ class AnsibleInventoryLoader(object):
         # https://github.com/ansible/ansible/issues/50714
         bargs = ['python', ansible_inventory_path, '-i', self.source]
         ansible_version = _get_ansible_version(ansible_inventory_path[:-len('-inventory')])
-        if ansible_version != 'unknown' and Version(ansible_version) >= Version('2.5'):
-            bargs.extend(['--playbook-dir', self.source_dir])
+        if ansible_version != 'unknown':
+            this_version = Version(ansible_version)
+            if this_version >= Version('2.5'):
+                bargs.extend(['--playbook-dir', self.source_dir])
+            if this_version >= Version('2.8'):
+                if self.verbosity:
+                    # INFO: -vvv, DEBUG: -vvvvv, for inventory, any more than 3 makes little difference
+                    bargs.append('-{}'.format('v' * min(5, self.verbosity * 2 + 1)))
         logger.debug('Using base command: {}'.format(' '.join(bargs)))
         return bargs
 
@@ -302,7 +310,7 @@ class Command(BaseCommand):
             if enabled is not default:
                 enabled_value = getattr(self, 'enabled_value', None)
                 if enabled_value is not None:
-                    enabled = bool(str(enabled_value) == str(enabled))
+                    enabled = bool(str(enabled_value).lower() == str(enabled).lower())
                 else:
                     enabled = bool(enabled)
         if enabled is default:
@@ -870,20 +878,21 @@ class Command(BaseCommand):
         Load inventory from in-memory groups to the database, overwriting or
         merging as appropriate.
         '''
-        # FIXME: Attribute changes to superuser?
-        # Perform __in queries in batches (mainly for unit tests using SQLite).
-        self._batch_size = 500
-        self._build_db_instance_id_map()
-        self._build_mem_instance_id_map()
-        if self.overwrite:
-            self._delete_hosts()
-            self._delete_groups()
-            self._delete_group_children_and_hosts()
-        self._update_inventory()
-        self._create_update_groups()
-        self._create_update_hosts()
-        self._create_update_group_children()
-        self._create_update_group_hosts()
+        with advisory_lock('inventory_{}_update'.format(self.inventory.id)):
+            # FIXME: Attribute changes to superuser?
+            # Perform __in queries in batches (mainly for unit tests using SQLite).
+            self._batch_size = 500
+            self._build_db_instance_id_map()
+            self._build_mem_instance_id_map()
+            if self.overwrite:
+                self._delete_hosts()
+                self._delete_groups()
+                self._delete_group_children_and_hosts()
+            self._update_inventory()
+            self._create_update_groups()
+            self._create_update_hosts()
+            self._create_update_group_children()
+            self._create_update_group_hosts()
 
     def remote_tower_license_compare(self, local_license_type):
         # this requires https://github.com/ansible/ansible/pull/52747
@@ -1025,7 +1034,8 @@ class Command(BaseCommand):
 
             source = self.get_source_absolute_path(self.source)
 
-            data = AnsibleInventoryLoader(source=source, is_custom=self.is_custom, venv_path=venv_path).load()
+            data = AnsibleInventoryLoader(source=source, is_custom=self.is_custom,
+                                          venv_path=venv_path, verbosity=self.verbosity).load()
 
             logger.debug('Finished loading from source: %s', source)
             logger.info('Processing JSON output...')
@@ -1078,7 +1088,7 @@ class Command(BaseCommand):
                                 logger.warning('update computed fields took %d queries',
                                                len(connection.queries) - queries_before2)
                         # Check if the license is valid. 
-                        # If the license is not valid, a CommandError will be thrown, 
+                        # If the license is not valid, a CommandError will be thrown,
                         # and inventory update will be marked as invalid.
                         # with transaction.atomic() will roll back the changes.
                         license_fail = True

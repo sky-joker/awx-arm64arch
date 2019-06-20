@@ -91,7 +91,7 @@ class TestSwaggerGeneration():
         # The number of API endpoints changes over time, but let's just check
         # for a reasonable number here; if this test starts failing, raise/lower the bounds
         paths = JSON['paths']
-        assert 250 < len(paths) < 300
+        assert 250 < len(paths) < 350
         assert list(paths['/api/'].keys()) == ['get']
         assert list(paths['/api/v2/'].keys()) == ['get']
         assert list(sorted(
@@ -174,6 +174,11 @@ class TestSwaggerGeneration():
             data = re.sub(
                 r'''(\s+"client_id": ")([a-zA-Z0-9]{40})("\,\s*)''',
                 r'\1xxxx\3',
+                data
+            )
+            data = re.sub(
+                r'"action_node": "awx-[^"]+"',
+                '"action_node": "awx"',
                 data
             )
             f.write(data)

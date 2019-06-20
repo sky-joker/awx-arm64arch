@@ -1,22 +1,21 @@
 FROM centos:7
 
-RUN rpm -ivh https://dl.fedoraproject.org/pub/epel/7/aarch64/Packages/e/epel-release-7-11.noarch.rpm
+RUN yum install -y epel-release
 
 RUN yum install -y bzip2 \
     gcc-c++ \
     gettext \
     git \
     make \
+    nodejs \
     python36-setuptools
 
-RUN curl -L https://nodejs.org/dist/v8.16.0/node-v8.16.0-linux-arm64.tar.xz -O && \
-    tar Jxvf node-v8.16.0-linux-arm64.tar.xz && \
-    cd node-v8.16.0-linux-arm64 && \
-    cp -R * /usr/local/ && \
-    cd .. && \
-    rm -rf node-v8.16.0-linux-arm64*
+# Use the distro provided npm to bootstrap our required version of node
+RUN npm install -g n
+RUN n 10.15.0
+RUN yum remove -y nodejs
 
-RUN npm set progress=false
+ENV PATH=/usr/local/n/versions/node/10.15.0/bin:$PATH
 
 WORKDIR "/awx"
 

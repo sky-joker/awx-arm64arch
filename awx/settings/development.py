@@ -83,16 +83,18 @@ AWX_PROOT_ENABLED = True
 
 AWX_ISOLATED_USERNAME = 'root'
 AWX_ISOLATED_CHECK_INTERVAL = 1
+AWX_ISOLATED_PERIODIC_CHECK = 30
 AWX_ISOLATED_LAUNCH_TIMEOUT = 30
 
 # Disable Pendo on the UI for development/test.
 # Note: This setting may be overridden by database settings.
 PENDO_TRACKING_STATE = "off"
+INSIGHTS_TRACKING_STATE = False
 
 # Use Django-Jenkins if installed. Only run tests for awx.main app.
 try:
     import django_jenkins
-    INSTALLED_APPS += (django_jenkins.__name__,)  # noqa
+    INSTALLED_APPS += [django_jenkins.__name__,] # noqa
     PROJECT_APPS = ('awx.main.tests', 'awx.api.tests',)
 except ImportError:
     pass
@@ -111,10 +113,25 @@ if 'django_jenkins' in INSTALLED_APPS:
     PEP8_RCFILE = "setup.cfg"
     PYLINT_RCFILE = ".pylintrc"
 
-INSTALLED_APPS += ('rest_framework_swagger',)
+
+# debug toolbar and swagger assume that requirements/requirements_dev.txt are installed
+
+INSTALLED_APPS += [   # NOQA
+    'rest_framework_swagger',
+    'debug_toolbar',
+]
+
+MIDDLEWARE = [
+    'debug_toolbar.middleware.DebugToolbarMiddleware',
+] + MIDDLEWARE  # NOQA
+
+DEBUG_TOOLBAR_CONFIG = {
+    'ENABLE_STACKTRACES' : True,
+}
 
 # Configure a default UUID for development only.
 SYSTEM_UUID = '00000000-0000-0000-0000-000000000000'
+INSTALL_UUID = '00000000-0000-0000-0000-000000000000'
 
 # Store a snapshot of default settings at this point before loading any
 # customizable config files.
@@ -142,12 +159,21 @@ except ImportError:
     traceback.print_exc()
     sys.exit(1)
 
+
+CELERYBEAT_SCHEDULE.update({  # noqa
+    'isolated_heartbeat': {
+        'task': 'awx.main.tasks.awx_isolated_heartbeat',
+        'schedule': timedelta(seconds=AWX_ISOLATED_PERIODIC_CHECK),  # noqa
+        'options': {'expires': AWX_ISOLATED_PERIODIC_CHECK * 2},  # noqa
+    }
+})
+
 CLUSTER_HOST_ID = socket.gethostname()
 
-try:
-    socket.gethostbyname('docker.for.mac.host.internal')
+
+if 'Docker for Mac' in os.getenv('OS', ''):
     os.environ['SDB_NOTIFY_HOST'] = 'docker.for.mac.host.internal'
-except Exception:
+else:
     os.environ['SDB_NOTIFY_HOST'] = os.popen('ip route').read().split(' ')[2]
 
 WEBSOCKET_ORIGIN_WHITELIST = ['https://localhost:8043', 'https://localhost:3000']

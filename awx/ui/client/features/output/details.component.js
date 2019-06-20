@@ -465,7 +465,13 @@ function getCredentialDetails () {
 }
 
 function buildCredentialDetails (credential) {
-    const icon = `${credential.kind}`;
+    let icon;
+    if (credential.cloud) {
+        icon = 'cloud';
+    } else {
+        icon = `${credential.kind}`;
+    }
+
     const link = `/#/credentials/${credential.id}`;
     const tooltip = strings.get('tooltips.CREDENTIAL');
     const value = $filter('sanitize')(credential.name);
@@ -521,7 +527,7 @@ function getInstanceGroupDetails () {
 
     let isolated = null;
 
-    if (instanceGroup.controller_id) {
+    if (instanceGroup.is_isolated) {
         isolated = strings.get('details.ISOLATED');
     }
 
@@ -835,6 +841,8 @@ function JobDetailsController (
             finished,
             scm,
             inventoryScm,
+            scmRevision,
+            instanceGroup,
             environment,
             artifacts,
             executionNode
@@ -847,6 +855,8 @@ function JobDetailsController (
             vm.artifacts = getArtifactsDetails(artifacts);
             vm.executionNode = getExecutionNodeDetails(executionNode);
             vm.inventoryScm = getInventoryScmDetails(inventoryScm.id, inventoryScm.status);
+            vm.scmRevision = getSCMRevisionDetails(scmRevision);
+            vm.instanceGroup = getInstanceGroupDetails(instanceGroup);
             vm.status = getStatusDetails(status);
             vm.job.status = status;
         });

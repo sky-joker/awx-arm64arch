@@ -218,6 +218,13 @@ table, tbody {
     // float: right;
 }
 
+@media screen and (max-width: 1200px) {
+    .List-actionHolder--rootGroups {
+        justify-content: flex-start;
+        margin-bottom: 55px;
+    }
+}
+
 .List-actionHolder--leftAlign {
     margin-left: 50%;
     justify-content: flex-start;
@@ -381,6 +388,10 @@ table, tbody {
 
 .modal-body > .List-noItems {
     margin-top: 0px;
+}
+
+.modal-body > .List-emptyHostFilter {
+    margin-top: 20px;
 }
 
 .List-actionButton--selected,

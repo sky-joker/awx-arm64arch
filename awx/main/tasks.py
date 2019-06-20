@@ -1,10 +1,11 @@
+# -*- coding: utf-8 -*-
+
 # Copyright (c) 2015 Ansible, Inc.
 # All Rights Reserved.
 
 # Python
 from collections import OrderedDict, namedtuple
 import errno
-import fnmatch
 import functools
 import importlib
 import json
@@ -58,19 +59,22 @@ from awx.main.models import (
 from awx.main.constants import ACTIVE_STATES
 from awx.main.exceptions import AwxTaskError
 from awx.main.queue import CallbackQueueDispatcher
-from awx.main.expect import isolated_manager
+from awx.main.isolated import manager as isolated_manager
 from awx.main.dispatch.publish import task
 from awx.main.dispatch import get_local_queuename, reaper
 from awx.main.utils import (get_ssh_version, update_scm_url,
                             get_licenser,
                             ignore_inventory_computed_fields,
-                            ignore_inventory_group_removal, extract_ansible_vars, schedule_task_manager)
-from awx.main.utils.common import _get_ansible_version
+                            ignore_inventory_group_removal, extract_ansible_vars, schedule_task_manager,
+                            get_awx_version)
+from awx.main.utils.common import _get_ansible_version, get_custom_venv_choices
 from awx.main.utils.safe_yaml import safe_dump, sanitize_jinja
 from awx.main.utils.reload import stop_local_services
 from awx.main.utils.pglock import advisory_lock
 from awx.main.consumers import emit_channel_notification
+from awx.main import analytics
 from awx.conf import settings_registry
+from awx.conf.license import get_license
 
 from rest_framework.exceptions import PermissionDenied
 
@@ -91,15 +95,18 @@ Try upgrading OpenSSH or providing your private key in an different format. \
 logger = logging.getLogger('awx.main.tasks')
 
 
+class InvalidVirtualenvError(Exception):
+
+    def __init__(self, message):
+        self.message = message
+
+
 def dispatch_startup():
     startup_logger = logging.getLogger('awx.main.tasks')
-    startup_logger.info("Syncing Schedules")
+    startup_logger.debug("Syncing Schedules")
     for sch in Schedule.objects.all():
         try:
             sch.update_computed_fields()
-            from awx.main.signals import disable_activity_stream
-            with disable_activity_stream():
-                sch.save()
         except Exception:
             logger.exception("Failed to rebuild schedule {}.".format(sch))
 
@@ -179,20 +186,20 @@ def apply_cluster_membership_policies():
                 # NOTE: arguable behavior: policy-list-group is not added to
                 # instance's group count for consideration in minimum-policy rules
             if group_actual.instances:
-                logger.info("Policy List, adding Instances {} to Group {}".format(group_actual.instances, ig.name))
+                logger.debug("Policy List, adding Instances {} to Group {}".format(group_actual.instances, ig.name))
 
             if ig.controller_id is None:
                 actual_groups.append(group_actual)
             else:
                 # For isolated groups, _only_ apply the policy_instance_list
                 # do not add to in-memory list, so minimum rules not applied
-                logger.info('Committing instances to isolated group {}'.format(ig.name))
+                logger.debug('Committing instances to isolated group {}'.format(ig.name))
                 ig.instances.set(group_actual.instances)
 
         # Process Instance minimum policies next, since it represents a concrete lower bound to the
         # number of instances to make available to instance groups
         actual_instances = [Node(obj=i, groups=[]) for i in considered_instances if i.managed_by_policy]
-        logger.info("Total non-isolated instances:{} available for policy: {}".format(
+        logger.debug("Total non-isolated instances:{} available for policy: {}".format(
             total_instances, len(actual_instances)))
         for g in sorted(actual_groups, key=lambda x: len(x.instances)):
             policy_min_added = []
@@ -207,7 +214,7 @@ def apply_cluster_membership_policies():
                 i.groups.append(g.obj.id)
                 policy_min_added.append(i.obj.id)
             if policy_min_added:
-                logger.info("Policy minimum, adding Instances {} to Group {}".format(policy_min_added, g.obj.name))
+                logger.debug("Policy minimum, adding Instances {} to Group {}".format(policy_min_added, g.obj.name))
 
         # Finally, process instance policy percentages
         for g in sorted(actual_groups, key=lambda x: len(x.instances)):
@@ -223,7 +230,7 @@ def apply_cluster_membership_policies():
                 i.groups.append(g.obj.id)
                 policy_per_added.append(i.obj.id)
             if policy_per_added:
-                logger.info("Policy percentage, adding Instances {} to Group {}".format(policy_per_added, g.obj.name))
+                logger.debug("Policy percentage, adding Instances {} to Group {}".format(policy_per_added, g.obj.name))
 
         # Determine if any changes need to be made
         needs_change = False
@@ -232,7 +239,7 @@ def apply_cluster_membership_policies():
                 needs_change = True
                 break
         if not needs_change:
-            logger.info('Cluster policy no-op finished in {} seconds'.format(time.time() - started_compute))
+            logger.debug('Cluster policy no-op finished in {} seconds'.format(time.time() - started_compute))
             return
 
         # On a differential basis, apply instances to non-isolated groups
@@ -241,12 +248,12 @@ def apply_cluster_membership_policies():
                 instances_to_add = set(g.instances) - set(g.prior_instances)
                 instances_to_remove = set(g.prior_instances) - set(g.instances)
                 if instances_to_add:
-                    logger.info('Adding instances {} to group {}'.format(list(instances_to_add), g.obj.name))
+                    logger.debug('Adding instances {} to group {}'.format(list(instances_to_add), g.obj.name))
                     g.obj.instances.add(*instances_to_add)
                 if instances_to_remove:
-                    logger.info('Removing instances {} from group {}'.format(list(instances_to_remove), g.obj.name))
+                    logger.debug('Removing instances {} from group {}'.format(list(instances_to_remove), g.obj.name))
                     g.obj.instances.remove(*instances_to_remove)
-        logger.info('Cluster policy computation finished in {} seconds'.format(time.time() - started_compute))
+        logger.debug('Cluster policy computation finished in {} seconds'.format(time.time() - started_compute))
 
 
 @task(queue='tower_broadcast_all', exchange_type='fanout')
@@ -267,7 +274,7 @@ def delete_project_files(project_path):
     if os.path.exists(project_path):
         try:
             shutil.rmtree(project_path)
-            logger.info('Success removing project files {}'.format(project_path))
+            logger.debug('Success removing project files {}'.format(project_path))
         except Exception:
             logger.exception('Could not remove project directory {}'.format(project_path))
     if os.path.exists(lock_file):
@@ -322,6 +329,19 @@ def send_notifications(notification_list, job_id=None):
 
 
 @task()
+def gather_analytics():
+    if settings.PENDO_TRACKING_STATE == 'off':
+        return
+    try:
+        tgz = analytics.gather()
+        logger.debug('gathered analytics: {}'.format(tgz))
+        analytics.ship(tgz)
+    finally:
+        if os.path.exists(tgz):
+            os.remove(tgz)
+
+
+@task()
 def run_administrative_checks():
     logger.warn("Running administrative checks.")
     if not settings.TOWER_ADMIN_ALERTS:
@@ -349,7 +369,7 @@ def purge_old_stdout_files():
     for f in os.listdir(settings.JOBOUTPUT_ROOT):
         if os.path.getctime(os.path.join(settings.JOBOUTPUT_ROOT,f)) < nowtime - settings.LOCAL_STDOUT_EXPIRE_TIME:
             os.unlink(os.path.join(settings.JOBOUTPUT_ROOT,f))
-            logger.info("Removing {}".format(os.path.join(settings.JOBOUTPUT_ROOT,f)))
+            logger.debug("Removing {}".format(os.path.join(settings.JOBOUTPUT_ROOT,f)))
 
 
 @task(queue=get_local_queuename)
@@ -373,14 +393,9 @@ def cluster_node_heartbeat():
             instance_list.remove(inst)
     if this_inst:
         startup_event = this_inst.is_lost(ref_time=nowtime)
-        if this_inst.capacity == 0 and this_inst.enabled:
-            logger.warning('Rejoining the cluster as instance {}.'.format(this_inst.hostname))
-        if this_inst.enabled:
-            this_inst.refresh_capacity()
-        elif this_inst.capacity != 0 and not this_inst.enabled:
-            this_inst.capacity = 0
-            this_inst.save(update_fields=['capacity'])
+        this_inst.refresh_capacity()
         if startup_event:
+            logger.warning('Rejoining the cluster as instance {}.'.format(this_inst.hostname))
             return
     else:
         raise RuntimeError("Cluster Host Not Found: {}".format(settings.CLUSTER_HOST_ID))
@@ -453,7 +468,7 @@ def awx_isolated_heartbeat():
     # Slow pass looping over isolated IGs and their isolated instances
     if len(isolated_instance_qs) > 0:
         logger.debug("Managing isolated instances {}.".format(','.join([inst.hostname for inst in isolated_instance_qs])))
-        isolated_manager.IsolatedManager.health_check(isolated_instance_qs, awx_application_version)
+        isolated_manager.IsolatedManager().health_check(isolated_instance_qs)
 
 
 @task()
@@ -473,7 +488,7 @@ def awx_periodic_scheduler():
 
         old_schedules = Schedule.objects.enabled().before(last_run)
         for schedule in old_schedules:
-            schedule.save()
+            schedule.update_computed_fields()
         schedules = Schedule.objects.enabled().between(last_run, run_now)
 
         invalid_license = False
@@ -484,14 +499,14 @@ def awx_periodic_scheduler():
 
         for schedule in schedules:
             template = schedule.unified_job_template
-            schedule.save() # To update next_run timestamp.
+            schedule.update_computed_fields() # To update next_run timestamp.
             if template.cache_timeout_blocked:
                 logger.warn("Cache timeout is in the future, bypassing schedule for template %s" % str(template.id))
                 continue
             try:
                 job_kwargs = schedule.get_job_kwargs()
                 new_unified_job = schedule.unified_job_template.create_unified_job(**job_kwargs)
-                logger.info('Spawned {} from schedule {}-{}.'.format(
+                logger.debug('Spawned {} from schedule {}-{}.'.format(
                     new_unified_job.log_format, schedule.name, schedule.pk))
 
                 if invalid_license:
@@ -586,26 +601,39 @@ def update_inventory_computed_fields(inventory_id, should_update_hosts=True):
         raise
 
 
+def update_smart_memberships_for_inventory(smart_inventory):
+    current = set(SmartInventoryMembership.objects.filter(inventory=smart_inventory).values_list('host_id', flat=True))
+    new = set(smart_inventory.hosts.values_list('id', flat=True))
+    additions = new - current
+    removals = current - new
+    if additions or removals:
+        with transaction.atomic():
+            if removals:
+                SmartInventoryMembership.objects.filter(inventory=smart_inventory, host_id__in=removals).delete()
+            if additions:
+                add_for_inventory = [
+                    SmartInventoryMembership(inventory_id=smart_inventory.id, host_id=host_id)
+                    for host_id in additions
+                ]
+                SmartInventoryMembership.objects.bulk_create(add_for_inventory)
+        logger.debug('Smart host membership cached for {}, {} additions, {} removals, {} total count.'.format(
+            smart_inventory.pk, len(additions), len(removals), len(new)
+        ))
+        return True  # changed
+    return False
+
+
 @task()
 def update_host_smart_inventory_memberships():
-    try:
-        with transaction.atomic():
-            smart_inventories = Inventory.objects.filter(kind='smart', host_filter__isnull=False, pending_deletion=False)
-            SmartInventoryMembership.objects.all().delete()
-            memberships = []
-            changed_inventories = set([])
-            for smart_inventory in smart_inventories:
-                add_for_inventory = [
-                    SmartInventoryMembership(inventory_id=smart_inventory.id, host_id=host_id[0])
-                    for host_id in smart_inventory.hosts.values_list('id')
-                ]
-                memberships.extend(add_for_inventory)
-                if add_for_inventory:
-                    changed_inventories.add(smart_inventory)
-            SmartInventoryMembership.objects.bulk_create(memberships)
-    except IntegrityError as e:
-        logger.error("Update Host Smart Inventory Memberships failed due to an exception: {}".format(e))
-        return
+    smart_inventories = Inventory.objects.filter(kind='smart', host_filter__isnull=False, pending_deletion=False)
+    changed_inventories = set([])
+    for smart_inventory in smart_inventories:
+        try:
+            changed = update_smart_memberships_for_inventory(smart_inventory)
+            if changed:
+                changed_inventories.add(smart_inventory)
+        except IntegrityError:
+            logger.exception('Failed to update smart inventory memberships for {}'.format(smart_inventory.pk))
     # Update computed fields for changed inventories outside atomic action
     for smart_inventory in changed_inventories:
         smart_inventory.update_computed_fields(update_groups=False, update_hosts=False)
@@ -671,8 +699,6 @@ class BaseTask(object):
         """Reload the model instance from the database and update the
         given fields.
         """
-        output_replacements = updates.pop('output_replacements', None) or []
-
         try:
             with transaction.atomic():
                 # Retrieve the model instance.
@@ -683,9 +709,6 @@ class BaseTask(object):
                 if updates:
                     update_fields = ['modified']
                     for field, value in updates.items():
-                        if field in ('result_traceback'):
-                            for srch, repl in output_replacements:
-                                value = value.replace(srch, repl)
                         setattr(instance, field, value)
                         update_fields.append(field)
                         if field == 'status':
@@ -705,7 +728,6 @@ class BaseTask(object):
                 return self.update_model(
                     pk,
                     _attempt=_attempt + 1,
-                    output_replacements=output_replacements,
                     **updates
                 )
             else:
@@ -759,7 +781,12 @@ class BaseTask(object):
             'credentials': {
                 <awx.main.models.Credential>: '/path/to/decrypted/data',
                 <awx.main.models.Credential>: '/path/to/decrypted/data',
-                <awx.main.models.Credential>: '/path/to/decrypted/data',
+                ...
+            },
+            'certificates': {
+                <awx.main.models.Credential>: /path/to/signed/ssh/certificate,
+                <awx.main.models.Credential>: /path/to/signed/ssh/certificate,
+                ...
             }
         }
         '''
@@ -774,14 +801,13 @@ class BaseTask(object):
                 # and we're running an earlier version (<6.5).
                 if 'OPENSSH PRIVATE KEY' in data and not openssh_keys_supported:
                     raise RuntimeError(OPENSSH_KEY_ERROR)
-            for credential, data in private_data.get('credentials', {}).items():
                 # OpenSSH formatted keys must have a trailing newline to be
                 # accepted by ssh-add.
                 if 'OPENSSH PRIVATE KEY' in data and not data.endswith('\n'):
                     data += '\n'
                 # For credentials used with ssh-add, write to a named pipe which
                 # will be read then closed, instead of leaving the SSH key on disk.
-                if credential and credential.kind in ('ssh', 'scm') and not ssh_too_old:
+                if credential and credential.credential_type.namespace in ('ssh', 'scm') and not ssh_too_old:
                     try:
                         os.mkdir(os.path.join(private_data_dir, 'env'))
                     except OSError as e:
@@ -800,6 +826,13 @@ class BaseTask(object):
                     f.close()
                     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
                 private_data_files['credentials'][credential] = path
+            for credential, data in private_data.get('certificates', {}).items():
+                name = 'credential_%d-cert.pub' % credential.pk
+                path = os.path.join(private_data_dir, name)
+                with open(path, 'w') as f:
+                    f.write(data)
+                    f.close()
+                os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         return private_data_files
 
     def build_passwords(self, instance, runtime_passwords):
@@ -812,7 +845,7 @@ class BaseTask(object):
             '': '',
         }
 
-    def build_extra_vars_file(self, instance, private_data_dir, passwords):
+    def build_extra_vars_file(self, instance, private_data_dir):
         '''
         Build ansible yaml file filled with extra vars to be passed via -e@file.yml
         '''
@@ -866,16 +899,15 @@ class BaseTask(object):
         env['PATH'] = os.path.join(venv_path, "bin") + ":" + env['PATH']
         venv_libdir = os.path.join(venv_path, "lib")
 
-        if not isolated and not os.path.exists(venv_libdir):
-            raise RuntimeError(
-                'a valid Python virtualenv does not exist at {}'.format(venv_path)
-            )
-        env.pop('PYTHONPATH', None)  # default to none if no python_ver matches
-        for version in os.listdir(venv_libdir):
-            if fnmatch.fnmatch(version, 'python[23].*'):
-                if os.path.isdir(os.path.join(venv_libdir, version)):
-                    env['PYTHONPATH'] = os.path.join(venv_libdir, version, "site-packages") + ":"
-                    break
+        if not isolated and (
+            not os.path.exists(venv_libdir) or
+            os.path.join(venv_path, '') not in get_custom_venv_choices()
+        ):
+            raise InvalidVirtualenvError(_(
+                'Invalid virtual environment selected: {}'.format(venv_path)
+            ))
+
+        isolated_manager.set_pythonpath(venv_libdir, env)
 
     def add_awx_venv(self, env):
         env['VIRTUAL_ENV'] = settings.AWX_VENV_PATH
@@ -945,14 +977,8 @@ class BaseTask(object):
     def build_cwd(self, instance, private_data_dir):
         raise NotImplementedError
 
-    def build_output_replacements(self, instance, passwords={}):
-        return []
-
     def build_credentials_list(self, instance):
         return []
-
-    def get_idle_timeout(self):
-        return None
 
     def get_instance_timeout(self, instance):
         global_timeout_setting_name = instance._global_timeout_setting()
@@ -989,27 +1015,34 @@ class BaseTask(object):
         Hook for any steps to run before job/task is marked as complete.
         '''
 
-    def final_run_hook(self, instance, status, private_data_dir, fact_modification_times):
+    def final_run_hook(self, instance, status, private_data_dir, fact_modification_times, isolated_manager_instance=None):
         '''
         Hook for any steps to run after job/task is marked as complete.
         '''
 
     def event_handler(self, event_data):
-        '''
-        Ansible runner callback for events
-        '''
-
+        #
+        # ⚠️  D-D-D-DANGER ZONE ⚠️
+        # This method is called once for *every event* emitted by Ansible
+        # Runner as a playbook runs.  That means that changes to the code in
+        # this method are _very_ likely to introduce performance regressions.
+        #
+        # Even if this function is made on average .05s slower, it can have
+        # devastating performance implications for playbooks that emit
+        # tens or hundreds of thousands of events.
+        #
+        # Proceed with caution!
+        #
         '''
         Ansible runner puts a parent_uuid on each event, no matter what the type.
         AWX only saves the parent_uuid if the event is for a Job.
         '''
         if event_data.get(self.event_data_key, None):
-            if event_data[self.event_data_key] != 'job_id':
+            if self.event_data_key != 'job_id':
                 event_data.pop('parent_uuid', None)
         should_write_event = False
-        dispatcher = CallbackQueueDispatcher()
         event_data.setdefault(self.event_data_key, self.instance.id)
-        dispatcher.dispatch(event_data)
+        self.dispatcher.dispatch(event_data)
         self.event_ct += 1
 
         '''
@@ -1037,13 +1070,12 @@ class BaseTask(object):
         '''
         Ansible runner callback triggered on finished run
         '''
-        dispatcher = CallbackQueueDispatcher()
         event_data = {
             'event': 'EOF',
             'final_counter': self.event_ct,
         }
         event_data.setdefault(self.event_data_key, self.instance.id)
-        dispatcher.dispatch(event_data)
+        self.dispatcher.dispatch(event_data)
 
     def status_handler(self, status_data, runner_config):
         '''
@@ -1052,13 +1084,26 @@ class BaseTask(object):
         if status_data['status'] == 'starting':
             job_env = dict(runner_config.env)
             '''
-            Take the safe environment variables and overwrite 
+            Take the safe environment variables and overwrite
             '''
             for k, v in self.safe_env.items():
                 if k in job_env:
                     job_env[k] = v
             self.instance = self.update_model(self.instance.pk, job_args=json.dumps(runner_config.command),
                                               job_cwd=runner_config.cwd, job_env=job_env)
+
+    def check_handler(self, config):
+        '''
+        IsolatedManager callback triggered by the repeated checks of the isolated node
+        '''
+        job_env = build_safe_env(config['env'])
+        for k, v in self.safe_cred_env.items():
+            if k in job_env:
+                job_env[k] = v
+        self.instance = self.update_model(self.instance.pk,
+                                          job_args=json.dumps(config['command']),
+                                          job_cwd=config['cwd'],
+                                          job_env=job_env)
 
 
     @with_path_cleanup
@@ -1071,8 +1116,7 @@ class BaseTask(object):
                                           start_args='')  # blank field to remove encrypted passwords
 
         self.instance.websocket_emit_status("running")
-        status, rc, tb = 'error', None, ''
-        output_replacements = []
+        status, rc = 'error', None
         extra_update_fields = {}
         fact_modification_times = {}
         self.event_ct = 0
@@ -1081,10 +1125,13 @@ class BaseTask(object):
         Needs to be an object property because status_handler uses it in a callback context
         '''
         self.safe_env = {}
+        self.safe_cred_env = {}
         private_data_dir = None
+        isolated_manager_instance = None
 
         try:
             isolated = self.instance.is_isolated()
+            self.instance.send_notification_templates("running")
             self.pre_run_hook(self.instance)
             if self.instance.cancel_flag:
                 self.instance = self.update_model(self.instance.pk, status='canceled')
@@ -1114,11 +1161,8 @@ class BaseTask(object):
             # May have to serialize the value
             private_data_files = self.build_private_data_files(self.instance, private_data_dir)
             passwords = self.build_passwords(self.instance, kwargs)
-            self.build_extra_vars_file(self.instance, private_data_dir, passwords)
+            self.build_extra_vars_file(self.instance, private_data_dir)
             args = self.build_args(self.instance, private_data_dir, passwords)
-            # TODO: output_replacements hurts my head right now
-            #output_replacements = self.build_output_replacements(self.instance, **kwargs)
-            output_replacements = []
             cwd = self.build_cwd(self.instance, private_data_dir)
             process_isolation_params = self.build_params_process_isolation(self.instance,
                                                                            private_data_dir,
@@ -1132,14 +1176,15 @@ class BaseTask(object):
             for credential in credentials:
                 if credential:
                     credential.credential_type.inject_credential(
-                        credential, env, self.safe_env, args, private_data_dir
+                        credential, env, self.safe_cred_env, args, private_data_dir
                     )
+
+            self.safe_env.update(self.safe_cred_env)
+
             self.write_args_file(private_data_dir, args)
 
             password_prompts = self.get_password_prompts(passwords)
             expect_passwords = self.create_expect_passwords_data_struct(password_prompts, passwords)
-
-            self.instance = self.update_model(self.instance.pk, output_replacements=output_replacements)
 
             params = {
                 'ident': self.instance.id,
@@ -1154,9 +1199,9 @@ class BaseTask(object):
                 'finished_callback': self.finished_callback,
                 'status_handler': self.status_handler,
                 'settings': {
-                    'idle_timeout': self.get_idle_timeout() or "",
                     'job_timeout': self.get_instance_timeout(self.instance),
                     'pexpect_timeout': getattr(settings, 'PEXPECT_TIMEOUT', 5),
+                    'suppress_ansible_output': True,
                     **process_isolation_params,
                 },
             }
@@ -1182,30 +1227,32 @@ class BaseTask(object):
             if self.instance.is_isolated() is True:
                 module_args = None
                 if 'module_args' in params:
+                    # if it's adhoc, copy the module args
                     module_args = ansible_runner.utils.args2cmdline(
                         params.get('module_args'),
                     )
+                else:
+                    # otherwise, it's a playbook, so copy the project dir
+                    copy_tree(cwd, os.path.join(private_data_dir, 'project'))
                 shutil.move(
                     params.pop('inventory'),
                     os.path.join(private_data_dir, 'inventory')
                 )
-                copy_tree(cwd, os.path.join(private_data_dir, 'project'))
                 ansible_runner.utils.dump_artifacts(params)
-                manager_instance = isolated_manager.IsolatedManager(
-                    env,
+                isolated_manager_instance = isolated_manager.IsolatedManager(
                     cancelled_callback=lambda: self.update_model(self.instance.pk).cancel_flag,
-                    job_timeout=self.get_instance_timeout(self.instance),
-                    idle_timeout=self.get_idle_timeout(),
+                    check_callback=self.check_handler,
                 )
-                status, rc = manager_instance.run(self.instance,
-                                                  private_data_dir,
-                                                  params.get('playbook'),
-                                                  params.get('module'),
-                                                  module_args,
-                                                  event_data_key=self.event_data_key,
-                                                  ident=str(self.instance.pk))
-                self.event_ct = len(manager_instance.handled_events)
+                status, rc = isolated_manager_instance.run(self.instance,
+                                                           private_data_dir,
+                                                           params.get('playbook'),
+                                                           params.get('module'),
+                                                           module_args,
+                                                           event_data_key=self.event_data_key,
+                                                           ident=str(self.instance.pk))
+                self.event_ct = len(isolated_manager_instance.handled_events)
             else:
+                self.dispatcher = CallbackQueueDispatcher()
                 res = ansible_runner.interface.run(**params)
                 status = res.status
                 rc = res.rc
@@ -1215,13 +1262,15 @@ class BaseTask(object):
                 status = 'failed'
                 extra_update_fields['job_explanation'] = self.instance.job_explanation
 
+        except InvalidVirtualenvError as e:
+            extra_update_fields['job_explanation'] = e.message
+            logger.error('{} {}'.format(self.instance.log_format, e.message))
         except Exception:
-            # run_pexpect does not throw exceptions for cancel or timeout
             # this could catch programming or file system errors
-            tb = traceback.format_exc()
+            extra_update_fields['result_traceback'] = traceback.format_exc()
             logger.exception('%s Exception occurred while running task', self.instance.log_format)
         finally:
-            logger.info('%s finished running, producing %s events.', self.instance.log_format, self.event_ct)
+            logger.debug('%s finished running, producing %s events.', self.instance.log_format, self.event_ct)
 
         try:
             self.post_run_hook(self.instance, status)
@@ -1229,13 +1278,12 @@ class BaseTask(object):
             logger.exception('{} Post run hook errored.'.format(self.instance.log_format))
 
         self.instance = self.update_model(pk)
-        self.instance = self.update_model(pk, status=status, result_traceback=tb,
-                                          output_replacements=output_replacements,
+        self.instance = self.update_model(pk, status=status,
                                           emitted_events=self.event_ct,
                                           **extra_update_fields)
 
         try:
-            self.final_run_hook(self.instance, status, private_data_dir, fact_modification_times)
+            self.final_run_hook(self.instance, status, private_data_dir, fact_modification_times, isolated_manager_instance=isolated_manager_instance)
         except Exception:
             logger.exception('{} Final run hook errored.'.format(self.instance.log_format))
 
@@ -1264,34 +1312,23 @@ class RunJob(BaseTask):
             'credentials': {
                 <awx.main.models.Credential>: <credential_decrypted_ssh_key_data>,
                 <awx.main.models.Credential>: <credential_decrypted_ssh_key_data>,
-                <awx.main.models.Credential>: <credential_decrypted_ssh_key_data>
+                ...
+            },
+            'certificates': {
+                <awx.main.models.Credential>: <signed SSH certificate data>,
+                <awx.main.models.Credential>: <signed SSH certificate data>,
+                ...
             }
         }
         '''
         private_data = {'credentials': {}}
-        for credential in job.credentials.all():
+        for credential in job.credentials.prefetch_related('input_sources__source_credential').all():
             # If we were sent SSH credentials, decrypt them and send them
             # back (they will be written to a temporary file).
             if credential.has_input('ssh_key_data'):
                 private_data['credentials'][credential] = credential.get_input('ssh_key_data', default='')
-
-            if credential.kind == 'openstack':
-                openstack_auth = dict(auth_url=credential.get_input('host', default=''),
-                                      username=credential.get_input('username', default=''),
-                                      password=credential.get_input('password', default=''),
-                                      project_name=credential.get_input('project', default=''))
-                if credential.has_input('domain'):
-                    openstack_auth['domain_name'] = credential.get_input('domain', default='')
-                verify_state = credential.get_input('verify_ssl', default=True)
-                openstack_data = {
-                    'clouds': {
-                        'devstack': {
-                            'auth': openstack_auth,
-                            'verify': verify_state,
-                        },
-                    },
-                }
-                private_data['credentials'][credential] = yaml.safe_dump(openstack_data, default_flow_style=False, allow_unicode=True)
+            if credential.has_input('ssh_public_key_data'):
+                private_data.setdefault('certificates', {})[credential] = credential.get_input('ssh_public_key_data', default='')
 
         return private_data
 
@@ -1301,7 +1338,7 @@ class RunJob(BaseTask):
         and ansible-vault.
         '''
         passwords = super(RunJob, self).build_passwords(job, runtime_passwords)
-        cred = job.get_deprecated_credential('ssh')
+        cred = job.machine_credential
         if cred:
             for field in ('ssh_key_unlock', 'ssh_password', 'become_password', 'vault_password'):
                 value = runtime_passwords.get(field, cred.get_input('password' if field == 'ssh_password' else field, default=''))
@@ -1386,7 +1423,7 @@ class RunJob(BaseTask):
         # Set environment variables for cloud credentials.
         cred_files = private_data_files.get('credentials', {})
         for cloud_cred in job.cloud_credentials:
-            if cloud_cred and cloud_cred.kind == 'openstack':
+            if cloud_cred and cloud_cred.credential_type.namespace == 'openstack':
                 env['OS_CLIENT_CONFIG_FILE'] = cred_files.get(cloud_cred, '')
 
         for network_cred in job.network_credentials:
@@ -1409,7 +1446,7 @@ class RunJob(BaseTask):
         Build command line argument list for running ansible-playbook,
         optionally using ssh-agent for public/private key authentication.
         '''
-        creds = job.get_deprecated_credential('ssh')
+        creds = job.machine_credential
 
         ssh_username, become_username, become_method = '', '', ''
         if creds:
@@ -1447,7 +1484,8 @@ class RunJob(BaseTask):
                 if k == 'vault_password':
                     args.append('--ask-vault-pass')
                 else:
-                    vault_id = k.split('.')[1]
+                    # split only on the first dot in case the vault ID itself contains a dot
+                    vault_id = k.split('.', 1)[1]
                     args.append('--vault-id')
                     args.append('{}@prompt'.format(vault_id))
 
@@ -1479,7 +1517,7 @@ class RunJob(BaseTask):
     def build_playbook_path_relative_to_cwd(self, job, private_data_dir):
         return os.path.join(job.playbook)
 
-    def build_extra_vars_file(self, job, private_data_dir, passwords):
+    def build_extra_vars_file(self, job, private_data_dir):
         # Define special extra_vars for AWX, combine with job.extra_vars.
         extra_vars = job.awx_meta_vars()
 
@@ -1498,10 +1536,7 @@ class RunJob(BaseTask):
         return self._write_extra_vars_file(private_data_dir, extra_vars, safe_dict)
 
     def build_credentials_list(self, job):
-        return job.credentials.all()
-
-    def get_idle_timeout(self):
-        return getattr(settings, 'JOB_RUN_IDLE_TIMEOUT', None)
+        return job.credentials.prefetch_related('input_sources__source_credential').all()
 
     def get_password_prompts(self, passwords={}):
         d = super(RunJob, self).get_password_prompts(passwords)
@@ -1516,7 +1551,8 @@ class RunJob(BaseTask):
         d[r'Vault password:\s*?$'] = 'vault_password'
         for k, v in passwords.items():
             if k.startswith('vault_password.'):
-                vault_id = k.split('.')[1]
+                # split only on the first dot in case the vault ID itself contains a dot
+                vault_id = k.split('.', 1)[1]
                 d[r'Vault password \({}\):\s*?$'.format(vault_id)] = k
         return d
 
@@ -1566,8 +1602,12 @@ class RunJob(BaseTask):
                                             job_explanation=('Previous Task Failed: {"job_type": "%s", "job_name": "%s", "job_id": "%s"}' %
                                                              ('project_update', local_project_sync.name, local_project_sync.id)))
                     raise
+        if job.inventory.kind == 'smart':
+            # cache smart inventory memberships so that the host_filter query is not
+            # ran inside of the event saving code
+            update_smart_memberships_for_inventory(job.inventory)
 
-    def final_run_hook(self, job, status, private_data_dir, fact_modification_times):
+    def final_run_hook(self, job, status, private_data_dir, fact_modification_times, isolated_manager_instance=None):
         super(RunJob, self).final_run_hook(job, status, private_data_dir, fact_modification_times)
         if not private_data_dir:
             # If there's no private data dir, that means we didn't get into the
@@ -1579,7 +1619,8 @@ class RunJob(BaseTask):
                 os.path.join(private_data_dir, 'artifacts', str(job.id), 'fact_cache'),
                 fact_modification_times,
             )
-
+        if isolated_manager_instance:
+            isolated_manager_instance.cleanup()
         try:
             inventory = job.inventory
         except Inventory.DoesNotExist:
@@ -1653,12 +1694,18 @@ class RunProjectUpdate(BaseTask):
         env['ANSIBLE_CALLBACK_PLUGINS'] = self.get_path_to('..', 'plugins', 'callback')
         return env
 
-    def _build_scm_url_extra_vars(self, project_update, scm_username='', scm_password=''):
+    def _build_scm_url_extra_vars(self, project_update):
         '''
         Helper method to build SCM url and extra vars with parameters needed
         for authentication.
         '''
         extra_vars = {}
+        if project_update.credential:
+            scm_username = project_update.credential.get_input('username', default='')
+            scm_password = project_update.credential.get_input('password', default='')
+        else:
+            scm_username = ''
+            scm_password = ''
         scm_type = project_update.scm_type
         scm_url = update_scm_url(scm_type, project_update.scm_url,
                                  check_special_cases=False)
@@ -1704,11 +1751,9 @@ class RunProjectUpdate(BaseTask):
             args.append('-v')
         return args
 
-    def build_extra_vars_file(self, project_update, private_data_dir, passwords):
+    def build_extra_vars_file(self, project_update, private_data_dir):
         extra_vars = {}
-        scm_url, extra_vars_new = self._build_scm_url_extra_vars(project_update,
-                                                                 passwords.get('scm_username', ''),
-                                                                 passwords.get('scm_password', ''))
+        scm_url, extra_vars_new = self._build_scm_url_extra_vars(project_update)
         extra_vars.update(extra_vars_new)
 
         if project_update.project.scm_revision and project_update.job_type == 'run':
@@ -1718,6 +1763,8 @@ class RunProjectUpdate(BaseTask):
         extra_vars.update({
             'project_path': project_update.get_project_path(check_if_exists=False),
             'insights_url': settings.INSIGHTS_URL_BASE,
+            'awx_license_type': get_license(show_key=False).get('license_type', 'UNLICENSED'),
+            'awx_version': get_awx_version(),
             'scm_type': project_update.scm_type,
             'scm_url': scm_url,
             'scm_branch': scm_branch,
@@ -1737,33 +1784,6 @@ class RunProjectUpdate(BaseTask):
         self.build_cwd(project_update, private_data_dir)
         return os.path.join('project_update.yml')
 
-    def build_output_replacements(self, project_update, passwords={}):
-        '''
-        Return search/replace strings to prevent output URLs from showing
-        sensitive passwords.
-        '''
-        output_replacements = []
-        before_url, before_passwords = self._build_scm_url_extra_vars(project_update, passwords)
-        scm_username = before_passwords.get('scm_username', '')
-        scm_password = before_passwords.get('scm_password', '')
-        after_url = self._build_scm_url_extra_vars(project_update, passwords)[0]
-        if after_url != before_url:
-            output_replacements.append((before_url, after_url))
-        if project_update.scm_type == 'svn' and scm_username and scm_password:
-            d_before = {
-                'username': scm_username,
-                'password': scm_password,
-            }
-            d_after = {
-                'username': scm_username,
-                'password': HIDDEN_PASSWORD,
-            }
-            pattern1 = "username=\"%(username)s\" password=\"%(password)s\""
-            pattern2 = "--username '%(username)s' --password '%(password)s'"
-            output_replacements.append((pattern1 % d_before, pattern1 % d_after))
-            output_replacements.append((pattern2 % d_before, pattern2 % d_after))
-        return output_replacements
-
     def get_password_prompts(self, passwords={}):
         d = super(RunProjectUpdate, self).get_password_prompts(passwords)
         d[r'Username for.*:\s*?$'] = 'scm_username'
@@ -1775,9 +1795,6 @@ class RunProjectUpdate(BaseTask):
         # FIXME: Configure whether we should auto accept host keys?
         d[r'^Are you sure you want to continue connecting \(yes/no\)\?\s*?$'] = 'yes'
         return d
-
-    def get_idle_timeout(self):
-        return getattr(settings, 'PROJECT_UPDATE_IDLE_TIMEOUT', None)
 
     def _update_dependent_inventories(self, project_update, dependent_inventory_sources):
         scm_revision = project_update.project.scm_revision
@@ -1793,8 +1810,8 @@ class RunProjectUpdate(BaseTask):
             with transaction.atomic():
                 if InventoryUpdate.objects.filter(inventory_source=inv_src,
                                                   status__in=ACTIVE_STATES).exists():
-                    logger.info('Skipping SCM inventory update for `{}` because '
-                                'another update is already active.'.format(inv_src.name))
+                    logger.debug('Skipping SCM inventory update for `{}` because '
+                                 'another update is already active.'.format(inv_src.name))
                     continue
                 local_inv_update = inv_src.create_inventory_update(
                     _eager_fields=dict(
@@ -1832,9 +1849,9 @@ class RunProjectUpdate(BaseTask):
 
     def release_lock(self, instance):
         try:
-            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+            fcntl.lockf(self.lock_fd, fcntl.LOCK_UN)
         except IOError as e:
-            logger.error("I/O error({0}) while trying to open lock file [{1}]: {2}".format(e.errno, instance.get_lock_file(), e.strerror))
+            logger.error("I/O error({0}) while trying to release lock file [{1}]: {2}".format(e.errno, instance.get_lock_file(), e.strerror))
             os.close(self.lock_fd)
             raise
 
@@ -1850,7 +1867,7 @@ class RunProjectUpdate(BaseTask):
             raise RuntimeError(u'Invalid lock file path')
 
         try:
-            self.lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT)
+            self.lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
         except OSError as e:
             logger.error("I/O error({0}) while trying to open lock file [{1}]: {2}".format(e.errno, lock_path, e.strerror))
             raise
@@ -1860,9 +1877,9 @@ class RunProjectUpdate(BaseTask):
             try:
                 instance.refresh_from_db(fields=['cancel_flag'])
                 if instance.cancel_flag:
-                    logger.info("ProjectUpdate({0}) was cancelled".format(instance.pk))
+                    logger.debug("ProjectUpdate({0}) was cancelled".format(instance.pk))
                     return
-                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.lockf(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except IOError as e:
                 if e.errno not in (errno.EAGAIN, errno.EACCES):
@@ -1941,26 +1958,6 @@ class RunInventoryUpdate(BaseTask):
             injector = InventorySource.injectors[inventory_update.source](self.get_ansible_version(inventory_update))
             return injector.build_private_data(inventory_update, private_data_dir)
 
-    def build_passwords(self, inventory_update, runtime_passwords):
-        """Build a dictionary of authentication/credential information for
-        an inventory source.
-
-        This dictionary is used by `build_env`, below.
-        """
-        # Run the superclass implementation.
-        passwords = super(RunInventoryUpdate, self).build_passwords(inventory_update, runtime_passwords)
-
-        # Take key fields from the credential in use and add them to the
-        # passwords dictionary.
-        credential = inventory_update.get_cloud_credential()
-        if credential:
-            for subkey in ('username', 'host', 'project', 'client', 'tenant', 'subscription'):
-                passwords['source_%s' % subkey] = credential.get_input(subkey, default='')
-            for passkey in ('password', 'ssh_key_data', 'security_token', 'secret'):
-                k = 'source_%s' % passkey
-                passwords[k] = credential.get_input(passkey, default='')
-        return passwords
-
     def build_env(self, inventory_update, private_data_dir, isolated, private_data_files=None):
         """Build environment dictionary for inventory import.
 
@@ -1995,8 +1992,6 @@ class RunInventoryUpdate(BaseTask):
                 env['ANSIBLE_INVENTORY_ENABLED'] = 'auto'
             else:
                 env['ANSIBLE_INVENTORY_ENABLED'] = 'script'
-
-        # TODO: option for Automatic transformation of group names, ANSIBLE_TRANSFORM_INVALID_GROUP_CHARS
 
         if inventory_update.source in ['scm', 'custom']:
             for env_k in inventory_update.source_vars_dict:
@@ -2139,9 +2134,6 @@ class RunInventoryUpdate(BaseTask):
         # All credentials not used by inventory source injector
         return inventory_update.get_extra_credentials()
 
-    def get_idle_timeout(self):
-        return getattr(settings, 'INVENTORY_UPDATE_IDLE_TIMEOUT', None)
-
     def pre_run_hook(self, inventory_update):
         source_project = None
         if inventory_update.inventory_source:
@@ -2192,7 +2184,12 @@ class RunAdHocCommand(BaseTask):
             'credentials': {
                 <awx.main.models.Credential>: <credential_decrypted_ssh_key_data>,
                 <awx.main.models.Credential>: <credential_decrypted_ssh_key_data>,
-                <awx.main.models.Credential>: <credential_decrypted_ssh_key_data>
+                ...
+            },
+            'certificates': {
+                <awx.main.models.Credential>: <signed SSH certificate data>,
+                <awx.main.models.Credential>: <signed SSH certificate data>,
+                ...
             }
         }
         '''
@@ -2202,6 +2199,8 @@ class RunAdHocCommand(BaseTask):
         private_data = {'credentials': {}}
         if creds and creds.has_input('ssh_key_data'):
             private_data['credentials'][creds] = creds.get_input('ssh_key_data', default='')
+        if creds and creds.has_input('ssh_public_key_data'):
+            private_data.setdefault('certificates', {})[creds] = creds.get_input('ssh_public_key_data', default='')
         return private_data
 
     def build_passwords(self, ad_hoc_command, runtime_passwords):
@@ -2250,9 +2249,9 @@ class RunAdHocCommand(BaseTask):
         creds = ad_hoc_command.credential
         ssh_username, become_username, become_method = '', '', ''
         if creds:
-            ssh_username = creds.username
-            become_method = creds.become_method
-            become_username = creds.become_username
+            ssh_username = creds.get_input('username', default='')
+            become_method = creds.get_input('become_method', default='')
+            become_username = creds.get_input('become_username', default='')
         else:
             become_method = None
             become_username = ""
@@ -2302,7 +2301,7 @@ class RunAdHocCommand(BaseTask):
 
         return args
 
-    def build_extra_vars_file(self, ad_hoc_command, private_data_dir, passwords={}):
+    def build_extra_vars_file(self, ad_hoc_command, private_data_dir):
         extra_vars = ad_hoc_command.awx_meta_vars()
 
         if ad_hoc_command.extra_vars_dict:
@@ -2329,9 +2328,6 @@ class RunAdHocCommand(BaseTask):
     def build_playbook_path_relative_to_cwd(self, job, private_data_dir):
         return None
 
-    def get_idle_timeout(self):
-        return getattr(settings, 'JOB_RUN_IDLE_TIMEOUT', None)
-
     def get_password_prompts(self, passwords={}):
         d = super(RunAdHocCommand, self).get_password_prompts()
         d[r'Enter passphrase for .*:\s*?$'] = 'ssh_key_unlock'
@@ -2349,6 +2345,11 @@ class RunAdHocCommand(BaseTask):
         Return whether this task should use proot.
         '''
         return getattr(settings, 'AWX_PROOT_ENABLED', False)
+
+    def final_run_hook(self, adhoc_job, status, private_data_dir, fact_modification_times, isolated_manager_instance=None):
+        super(RunAdHocCommand, self).final_run_hook(adhoc_job, status, private_data_dir, fact_modification_times)
+        if isolated_manager_instance:
+            isolated_manager_instance.cleanup()
 
 
 @task()
@@ -2429,7 +2430,7 @@ def deep_copy_model_obj(
     model_module, model_name, obj_pk, new_obj_pk,
     user_pk, sub_obj_list, permission_check_func=None
 ):
-    logger.info('Deep copy {} from {} to {}.'.format(model_name, obj_pk, new_obj_pk))
+    logger.debug('Deep copy {} from {} to {}.'.format(model_name, obj_pk, new_obj_pk))
     from awx.api.generics import CopyAPIView
     from awx.main.signals import disable_activity_stream
     model = getattr(importlib.import_module(model_module), model_name, None)

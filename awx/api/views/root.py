@@ -25,8 +25,8 @@ from awx.main.utils import (
     get_custom_venv_choices,
     to_python_boolean,
 )
-from awx.api.versioning import reverse, get_request_version, drf_reverse
-from awx.conf.license import get_license, feature_enabled
+from awx.api.versioning import reverse, drf_reverse
+from awx.conf.license import get_license
 from awx.main.constants import PRIVILEGE_ESCALATION_METHODS
 from awx.main.models import (
     Project,
@@ -42,7 +42,7 @@ logger = logging.getLogger('awx.api.views.root')
 class ApiRootView(APIView):
 
     permission_classes = (AllowAny,)
-    view_name = _('REST API')
+    name = _('REST API')
     versioning_class = None
     swagger_topic = 'Versioning'
 
@@ -50,23 +50,21 @@ class ApiRootView(APIView):
     def get(self, request, format=None):
         ''' List supported API versions '''
 
-        v1 = reverse('api:api_v1_root_view', kwargs={'version': 'v1'})
         v2 = reverse('api:api_v2_root_view', kwargs={'version': 'v2'})
         data = OrderedDict()
         data['description'] = _('AWX REST API')
         data['current_version'] = v2
-        data['available_versions'] = dict(v1 = v1, v2 = v2)
+        data['available_versions'] = dict(v2 = v2)
         data['oauth2'] = drf_reverse('api:oauth_authorization_root_view')
-        if feature_enabled('rebranding'):
-            data['custom_logo'] = settings.CUSTOM_LOGO
-            data['custom_login_info'] = settings.CUSTOM_LOGIN_INFO
+        data['custom_logo'] = settings.CUSTOM_LOGO
+        data['custom_login_info'] = settings.CUSTOM_LOGIN_INFO
         return Response(data)
 
 
 class ApiOAuthAuthorizationRootView(APIView):
 
     permission_classes = (AllowAny,)
-    view_name = _("API OAuth 2 Authorization Root")
+    name = _("API OAuth 2 Authorization Root")
     versioning_class = None
     swagger_topic = 'Authentication'
 
@@ -86,10 +84,10 @@ class ApiVersionRootView(APIView):
     def get(self, request, format=None):
         ''' List top level resources '''
         data = OrderedDict()
-        data['ping'] = reverse('api:api_v1_ping_view', request=request)
+        data['ping'] = reverse('api:api_v2_ping_view', request=request)
         data['instances'] = reverse('api:instance_list', request=request)
         data['instance_groups'] = reverse('api:instance_group_list', request=request)
-        data['config'] = reverse('api:api_v1_config_view', request=request)
+        data['config'] = reverse('api:api_v2_config_view', request=request)
         data['settings'] = reverse('api:setting_category_list', request=request)
         data['me'] = reverse('api:user_me_list', request=request)
         data['dashboard'] = reverse('api:dashboard_view', request=request)
@@ -99,10 +97,11 @@ class ApiVersionRootView(APIView):
         data['project_updates'] = reverse('api:project_update_list', request=request)
         data['teams'] = reverse('api:team_list', request=request)
         data['credentials'] = reverse('api:credential_list', request=request)
-        if get_request_version(request) > 1:
-            data['credential_types'] = reverse('api:credential_type_list', request=request)
-            data['applications'] = reverse('api:o_auth2_application_list', request=request)
-            data['tokens'] = reverse('api:o_auth2_token_list', request=request)
+        data['credential_types'] = reverse('api:credential_type_list', request=request)
+        data['credential_input_sources'] = reverse('api:credential_input_source_list', request=request)
+        data['applications'] = reverse('api:o_auth2_application_list', request=request)
+        data['tokens'] = reverse('api:o_auth2_token_list', request=request)
+        data['metrics'] = reverse('api:metrics_view', request=request)
         data['inventory'] = reverse('api:inventory_list', request=request)
         data['inventory_scripts'] = reverse('api:inventory_script_list', request=request)
         data['inventory_sources'] = reverse('api:inventory_source_list', request=request)
@@ -130,21 +129,17 @@ class ApiVersionRootView(APIView):
         return Response(data)
 
 
-class ApiV1RootView(ApiVersionRootView):
-    view_name = _('Version 1')
-
-
 class ApiV2RootView(ApiVersionRootView):
-    view_name = _('Version 2')
+    name = _('Version 2')
 
 
-class ApiV1PingView(APIView):
+class ApiV2PingView(APIView):
     """A simple view that reports very basic information about this
     instance, which is acceptable to be public information.
     """
     permission_classes = (AllowAny,)
     authentication_classes = ()
-    view_name = _('Ping')
+    name = _('Ping')
     swagger_topic = 'System Configuration'
 
     def get(self, request, format=None):
@@ -157,29 +152,30 @@ class ApiV1PingView(APIView):
             'ha': is_ha_environment(),
             'version': get_awx_version(),
             'active_node': settings.CLUSTER_HOST_ID,
+            'install_uuid': settings.INSTALL_UUID,
         }
 
         response['instances'] = []
         for instance in Instance.objects.all():
-            response['instances'].append(dict(node=instance.hostname, heartbeat=instance.modified,
+            response['instances'].append(dict(node=instance.hostname, uuid=instance.uuid, heartbeat=instance.modified,
                                               capacity=instance.capacity, version=instance.version))
             sorted(response['instances'], key=operator.itemgetter('node'))
         response['instance_groups'] = []
-        for instance_group in InstanceGroup.objects.all():
+        for instance_group in InstanceGroup.objects.prefetch_related('instances'):
             response['instance_groups'].append(dict(name=instance_group.name,
                                                     capacity=instance_group.capacity,
                                                     instances=[x.hostname for x in instance_group.instances.all()]))
         return Response(response)
 
 
-class ApiV1ConfigView(APIView):
+class ApiV2ConfigView(APIView):
 
     permission_classes = (IsAuthenticated,)
-    view_name = _('Configuration')
+    name = _('Configuration')
     swagger_topic = 'System Configuration'
 
     def check_permissions(self, request):
-        super(ApiV1ConfigView, self).check_permissions(request)
+        super(ApiV2ConfigView, self).check_permissions(request)
         if not request.user.is_superuser and request.method.lower() not in {'options', 'head', 'get'}:
             self.permission_denied(request)  # Raises PermissionDenied exception.
 
@@ -211,7 +207,7 @@ class ApiV1ConfigView(APIView):
         # If LDAP is enabled, user_ldap_fields will return a list of field
         # names that are managed by LDAP and should be read-only for users with
         # a non-empty ldap_dn attribute.
-        if getattr(settings, 'AUTH_LDAP_SERVER_URI', None) and feature_enabled('ldap'):
+        if getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
             user_ldap_fields = ['username', 'password']
             user_ldap_fields.extend(getattr(settings, 'AUTH_LDAP_USER_ATTR_MAP', {}).keys())
             user_ldap_fields.extend(getattr(settings, 'AUTH_LDAP_USER_FLAGS_BY_GROUP', {}).keys())
@@ -220,7 +216,8 @@ class ApiV1ConfigView(APIView):
         if request.user.is_superuser \
                 or request.user.is_system_auditor \
                 or Organization.accessible_objects(request.user, 'admin_role').exists() \
-                or Organization.accessible_objects(request.user, 'auditor_role').exists():
+                or Organization.accessible_objects(request.user, 'auditor_role').exists() \
+                or Organization.accessible_objects(request.user, 'project_admin_role').exists():
             data.update(dict(
                 project_base_dir = settings.PROJECTS_ROOT,
                 project_local_paths = Project.get_local_path_choices(),
@@ -276,6 +273,3 @@ class ApiV1ConfigView(APIView):
         except Exception:
             # FIX: Log
             return Response({"error": _("Failed to remove license.")}, status=status.HTTP_400_BAD_REQUEST)
-
-
-

@@ -7,14 +7,14 @@ function InstanceGroupsStrings (BaseString) {
     ns.state = {
         INSTANCE_GROUPS_BREADCRUMB_LABEL: t.s('INSTANCE GROUPS'),
         INSTANCES_BREADCRUMB_LABEL: t.s('INSTANCES'),
-        ADD_BREADCRUMB_LABEL: t.s('CREATE INSTANCE GROUP'),
-        EDIT_BREADCRUMB_LABEL: t.s('EDIT INSTANCE GROUP')
+        ADD_BREADCRUMB_LABEL: t.s('CREATE INSTANCE GROUP')
     };
 
     ns.list = {
         MANUAL: t.s('MANUAL'),
         PANEL_TITLE: t.s('INSTANCE GROUPS'),
         ROW_ITEM_LABEL_INSTANCES: t.s('Instances'),
+        ROW_ITEM_LABEL_ISOLATED: t.s('ISOLATED'),
         ROW_ITEM_LABEL_RUNNING_JOBS: t.s('Running Jobs'),
         ROW_ITEM_LABEL_TOTAL_JOBS: t.s('Total Jobs'),
         ROW_ITEM_LABEL_USED_CAPACITY: t.s('Used Capacity')
@@ -59,13 +59,8 @@ function InstanceGroupsStrings (BaseString) {
         DELETE: t.s('Unable to delete instance group.'),
     };
 
-    ns.alert  = {
+    ns.alert = {
         MISSING_PARAMETER: t.s('Instance Group parameter is missing.'),
-    };
-
-    ns.sort = {
-        NAME_ASCENDING: t.s('Name (Ascending)'),
-        NAME_DESCENDING: t.s('Name (Descending)')
     };
 }
 

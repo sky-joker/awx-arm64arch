@@ -24,11 +24,10 @@ from awx.api.generics import (
     RetrieveUpdateDestroyAPIView,
 )
 from awx.api.permissions import IsSuperUser
-from awx.api.versioning import reverse, get_request_version
+from awx.api.versioning import reverse
 from awx.main.utils import camelcase_to_underscore
 from awx.main.utils.handlers import AWXProxyHandler, LoggingConnectivityException
 from awx.main.tasks import handle_setting_changes
-from awx.conf.license import get_licensed_features
 from awx.conf.models import Setting
 from awx.conf.serializers import SettingCategorySerializer, SettingSingletonSerializer
 from awx.conf import settings_registry
@@ -36,24 +35,17 @@ from awx.conf import settings_registry
 
 SettingCategory = collections.namedtuple('SettingCategory', ('url', 'slug', 'name'))
 
-VERSION_SPECIFIC_CATEGORIES_TO_EXCLUDE = {
-    1: set([
-        'named-url',
-    ]),
-    2: set([]),
-}
-
 
 class SettingCategoryList(ListAPIView):
 
     model = Setting  # Not exactly, but needed for the view.
     serializer_class = SettingCategorySerializer
     filter_backends = []
-    view_name = _('Setting Categories')
+    name = _('Setting Categories')
 
     def get_queryset(self):
         setting_categories = []
-        categories = settings_registry.get_registered_categories(features_enabled=get_licensed_features())
+        categories = settings_registry.get_registered_categories()
         if self.request.user.is_superuser or self.request.user.is_system_auditor:
             pass  # categories = categories
         elif 'user' in categories:
@@ -61,8 +53,6 @@ class SettingCategoryList(ListAPIView):
         else:
             categories = {}
         for category_slug in sorted(categories.keys()):
-            if category_slug in VERSION_SPECIFIC_CATEGORIES_TO_EXCLUDE[get_request_version(self.request)]:
-                continue
             url = reverse('api:setting_singleton_detail', kwargs={'category_slug': category_slug}, request=self.request)
             setting_categories.append(SettingCategory(url, category_slug, categories[category_slug]))
         return setting_categories
@@ -73,13 +63,11 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
     model = Setting  # Not exactly, but needed for the view.
     serializer_class = SettingSingletonSerializer
     filter_backends = []
-    view_name = _('Setting Detail')
+    name = _('Setting Detail')
 
     def get_queryset(self):
         self.category_slug = self.kwargs.get('category_slug', 'all')
-        all_category_slugs = list(settings_registry.get_registered_categories(features_enabled=get_licensed_features()).keys())
-        for slug_to_delete in VERSION_SPECIFIC_CATEGORIES_TO_EXCLUDE[get_request_version(self.request)]:
-            all_category_slugs.remove(slug_to_delete)
+        all_category_slugs = list(settings_registry.get_registered_categories().keys())
         if self.request.user.is_superuser or getattr(self.request.user, 'is_system_auditor', False):
             category_slugs = all_category_slugs
         else:
@@ -90,8 +78,7 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
             raise PermissionDenied()
 
         registered_settings = settings_registry.get_registered_settings(
-            category_slug=self.category_slug, read_only=False, features_enabled=get_licensed_features(),
-            slugs_to_ignore=VERSION_SPECIFIC_CATEGORIES_TO_EXCLUDE[get_request_version(self.request)]
+            category_slug=self.category_slug, read_only=False,
         )
         if self.category_slug == 'user':
             return Setting.objects.filter(key__in=registered_settings, user=self.request.user)
@@ -101,8 +88,7 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
     def get_object(self):
         settings_qs = self.get_queryset()
         registered_settings = settings_registry.get_registered_settings(
-            category_slug=self.category_slug, features_enabled=get_licensed_features(),
-            slugs_to_ignore=VERSION_SPECIFIC_CATEGORIES_TO_EXCLUDE[get_request_version(self.request)]
+            category_slug=self.category_slug,
         )
         all_settings = {}
         for setting in settings_qs:
@@ -168,7 +154,7 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
 
 class SettingLoggingTest(GenericAPIView):
 
-    view_name = _('Logging Connectivity Test')
+    name = _('Logging Connectivity Test')
     model = Setting
     serializer_class = SettingSingletonSerializer
     permission_classes = (IsSuperUser,)

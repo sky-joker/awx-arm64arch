@@ -2,7 +2,6 @@
 # All Rights Reserved.
 
 # Python
-import base64
 import json
 import yaml
 import logging
@@ -16,13 +15,11 @@ import contextlib
 import tempfile
 import psutil
 from functools import reduce, wraps
-from io import StringIO
 
 from decimal import Decimal
 
 # Django
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import DatabaseError
 from django.utils.translation import ugettext_lazy as _
 from django.db.models.fields.related import ForeignObjectRel, ManyToManyField
 from django.db.models.query import QuerySet
@@ -36,16 +33,16 @@ from django.apps import apps
 
 logger = logging.getLogger('awx.main.utils')
 
-__all__ = ['get_object_or_400', 'camelcase_to_underscore', 'memoize', 'memoize_delete',
+__all__ = ['get_object_or_400', 'camelcase_to_underscore', 'underscore_to_camelcase', 'memoize', 'memoize_delete',
            'get_ansible_version', 'get_ssh_version', 'get_licenser', 'get_awx_version', 'update_scm_url',
            'get_type_for_model', 'get_model_for_type', 'copy_model_by_class', 'region_sorting',
            'copy_m2m_relationships', 'prefetch_page_capabilities', 'to_python_boolean',
            'ignore_inventory_computed_fields', 'ignore_inventory_group_removal',
            '_inventory_updates', 'get_pk_from_dict', 'getattrd', 'getattr_dne', 'NoDefaultProvided',
-           'get_current_apps', 'set_current_apps', 'OutputEventFilter', 'OutputVerboseFilter',
+           'get_current_apps', 'set_current_apps',
            'extract_ansible_vars', 'get_search_fields', 'get_system_task_capacity', 'get_cpu_capacity', 'get_mem_capacity',
            'wrap_args_with_proot', 'build_proot_temp_dir', 'check_proot_installed', 'model_to_dict',
-           'model_instance_diff', 'timestamp_apiformat', 'parse_yaml_or_json', 'RequireDebugTrueOrTest',
+           'model_instance_diff', 'parse_yaml_or_json', 'RequireDebugTrueOrTest',
            'has_model_field_prefetched', 'set_environ', 'IllegalArgumentError', 'get_custom_venv_choices', 'get_external_account',
            'task_manager_bulk_reschedule', 'schedule_task_manager', 'classproperty']
 
@@ -92,6 +89,14 @@ def camelcase_to_underscore(s):
     '''
     s = re.sub(r'(((?<=[a-z])[A-Z])|([A-Z](?![A-Z]|$)))', '_\\1', s)
     return s.lower().strip('_')
+
+
+def underscore_to_camelcase(s):
+    '''
+    Convert lowercase_with_underscore names to CamelCase.
+    '''
+    return ''.join(x.capitalize() or '_' for x in s.split('_'))
+
 
 
 class RequireDebugTrueOrTest(logging.Filter):
@@ -425,10 +430,8 @@ def model_to_dict(obj, serializer_mapping=None):
 
     allowed_fields = get_allowed_fields(obj, serializer_mapping)
 
-    for field in obj._meta.fields:
-        if field.name not in allowed_fields:
-            continue
-        attr_d[field.name] = _convert_model_field_for_display(obj, field.name, password_fields=password_fields)
+    for field_name in allowed_fields:
+        attr_d[field_name] = _convert_model_field_for_display(obj, field_name, password_fields=password_fields)
     return attr_d
 
 
@@ -501,20 +504,16 @@ def get_type_for_model(model):
     return camelcase_to_underscore(opts.object_name)
 
 
-def get_model_for_type(type):
+def get_model_for_type(type_name):
     '''
     Return model class for a given type name.
     '''
-    from django.contrib.contenttypes.models import ContentType
-    for ct in ContentType.objects.filter(Q(app_label='main') | Q(app_label='auth', model='user')):
-        ct_model = ct.model_class()
-        if not ct_model:
-            continue
-        ct_type = get_type_for_model(ct_model)
-        if type == ct_type:
-            return ct_model
+    model_str = underscore_to_camelcase(type_name)
+    if model_str == 'User':
+        use_app = 'auth'
     else:
-        raise DatabaseError('"{}" is not a valid AWX model.'.format(type))
+        use_app = 'main'
+    return apps.get_model(use_app, model_str)
 
 
 def prefetch_page_capabilities(model, page, prefetch_list, user):
@@ -897,13 +896,6 @@ def get_pk_from_dict(_dict, key):
         return None
 
 
-def timestamp_apiformat(timestamp):
-    timestamp = timestamp.isoformat()
-    if timestamp.endswith('+00:00'):
-        timestamp = timestamp[:-6] + 'Z'
-    return timestamp
-
-
 class NoDefaultProvided(object):
     pass
 
@@ -961,117 +953,6 @@ def get_custom_venv_choices(custom_paths=None):
     return custom_venv_choices
 
 
-class OutputEventFilter(object):
-    '''
-    File-like object that looks for encoded job events in stdout data.
-    '''
-
-    EVENT_DATA_RE = re.compile(r'\x1b\[K((?:[A-Za-z0-9+/=]+\x1b\[\d+D)+)\x1b\[K')
-
-    def __init__(self, event_callback):
-        self._event_callback = event_callback
-        self._counter = 0
-        self._start_line = 0
-        self._buffer = StringIO()
-        self._last_chunk = ''
-        self._current_event_data = None
-
-    def flush(self):
-        # pexpect wants to flush the file it writes to, but we're not
-        # actually capturing stdout to a raw file; we're just
-        # implementing a custom `write` method to discover and emit events from
-        # the stdout stream
-        pass
-
-    def write(self, data):
-        data = smart_str(data)
-        self._buffer.write(data)
-
-        # keep a sliding window of the last chunk written so we can detect
-        # event tokens and determine if we need to perform a search of the full
-        # buffer
-        should_search = '\x1b[K' in (self._last_chunk + data)
-        self._last_chunk = data
-
-        # Only bother searching the buffer if we recently saw a start/end
-        # token (\x1b[K)
-        while should_search:
-            value = self._buffer.getvalue()
-            match = self.EVENT_DATA_RE.search(value)
-            if not match:
-                break
-            try:
-                base64_data = re.sub(r'\x1b\[\d+D', '', match.group(1))
-                event_data = json.loads(base64.b64decode(base64_data))
-            except ValueError:
-                event_data = {}
-            self._emit_event(value[:match.start()], event_data)
-            remainder = value[match.end():]
-            self._buffer = StringIO()
-            self._buffer.write(remainder)
-            self._last_chunk = remainder
-
-    def close(self):
-        value = self._buffer.getvalue()
-        if value:
-            self._emit_event(value)
-            self._buffer = StringIO()
-        self._event_callback(dict(event='EOF', final_counter=self._counter))
-
-    def _emit_event(self, buffered_stdout, next_event_data=None):
-        next_event_data = next_event_data or {}
-        if self._current_event_data:
-            event_data = self._current_event_data
-            stdout_chunks = [buffered_stdout]
-        elif buffered_stdout:
-            event_data = dict(event='verbose')
-            stdout_chunks = buffered_stdout.splitlines(True)
-        else:
-            stdout_chunks = []
-
-        for stdout_chunk in stdout_chunks:
-            self._counter += 1
-            event_data['counter'] = self._counter
-            event_data['stdout'] = stdout_chunk[:-2] if len(stdout_chunk) > 2 else ""
-            n_lines = stdout_chunk.count('\n')
-            event_data['start_line'] = self._start_line
-            event_data['end_line'] = self._start_line + n_lines
-            self._start_line += n_lines
-            if self._event_callback:
-                self._event_callback(event_data)
-
-        if next_event_data.get('uuid', None):
-            self._current_event_data = next_event_data
-        else:
-            self._current_event_data = None
-
-
-class OutputVerboseFilter(OutputEventFilter):
-    '''
-    File-like object that dispatches stdout data.
-    Does not search for encoded job event data.
-    Use for unified job types that do not encode job event data.
-    '''
-    def write(self, data):
-        self._buffer.write(data)
-
-        # if the current chunk contains a line break
-        if data and '\n' in data:
-            # emit events for all complete lines we know about
-            lines = self._buffer.getvalue().splitlines(True)  # keep ends
-            remainder = None
-            # if last line is not a complete line, then exclude it
-            if '\n' not in lines[-1]:
-                remainder = lines.pop()
-            # emit all complete lines
-            for line in lines:
-                self._emit_event(line)
-            self._buffer = StringIO()
-            # put final partial line back on buffer
-            if remainder:
-                self._buffer.write(remainder)
-
-
 def is_ansible_variable(key):
     return key.startswith('ansible_')
 
@@ -1103,9 +984,8 @@ def has_model_field_prefetched(model_obj, field_name):
 
 def get_external_account(user):
     from django.conf import settings
-    from awx.conf.license import feature_enabled
     account_type = None
-    if getattr(settings, 'AUTH_LDAP_SERVER_URI', None) and feature_enabled('ldap'):
+    if getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
         try:
             if user.pk and user.profile.ldap_dn and not user.has_usable_password():
                 account_type = "ldap"

@@ -6,7 +6,6 @@ import copy
 import json
 import logging
 import re
-import urllib.parse
 from collections import OrderedDict
 from datetime import timedelta
 
@@ -16,6 +15,7 @@ from oauthlib.common import generate_token
 
 # Django
 from django.conf import settings
+from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError as DjangoValidationError
@@ -46,15 +46,15 @@ from awx.main.constants import (
     CENSOR_VALUE,
 )
 from awx.main.models import (
-    ActivityStream, AdHocCommand, AdHocCommandEvent, Credential,
-    CredentialType, CustomInventoryScript, Fact, Group, Host, Instance,
+    ActivityStream, AdHocCommand, AdHocCommandEvent, Credential, CredentialInputSource,
+    CredentialType, CustomInventoryScript, Group, Host, Instance,
     InstanceGroup, Inventory, InventorySource, InventoryUpdate,
     InventoryUpdateEvent, Job, JobEvent, JobHostSummary, JobLaunchConfig,
-    JobTemplate, Label, Notification, NotificationTemplate, OAuth2AccessToken,
-    OAuth2Application, Organization, Project, ProjectUpdate,
-    ProjectUpdateEvent, RefreshToken, Role, Schedule, SystemJob,
-    SystemJobEvent, SystemJobTemplate, Team, UnifiedJob, UnifiedJobTemplate,
-    UserSessionMembership, V1Credential, WorkflowJob, WorkflowJobNode,
+    JobTemplate, Label, Notification, NotificationTemplate,
+    OAuth2AccessToken, OAuth2Application, Organization, Project,
+    ProjectUpdate, ProjectUpdateEvent, RefreshToken, Role, Schedule,
+    SystemJob, SystemJobEvent, SystemJobTemplate, Team, UnifiedJob,
+    UnifiedJobTemplate, WorkflowJob, WorkflowJobNode,
     WorkflowJobTemplate, WorkflowJobTemplateNode, StdoutMaxBytesExceeded
 )
 from awx.main.models.base import VERBOSITY_CHOICES, NEW_JOB_TYPE_CHOICES
@@ -63,7 +63,7 @@ from awx.main.models.rbac import (
 )
 from awx.main.fields import ImplicitRoleField, JSONBField
 from awx.main.utils import (
-    get_type_for_model, get_model_for_type, timestamp_apiformat,
+    get_type_for_model, get_model_for_type,
     camelcase_to_underscore, getattrd, parse_yaml_or_json,
     has_model_field_prefetched, extract_ansible_vars, encrypt_dict,
     prefetch_page_capabilities, get_external_account)
@@ -72,8 +72,7 @@ from awx.main.redact import UriCleaner, REPLACE_STR
 
 from awx.main.validators import vars_validate_or_raise
 
-from awx.conf.license import feature_enabled, LicenseForbids
-from awx.api.versioning import reverse, get_request_version
+from awx.api.versioning import reverse
 from awx.api.fields import (BooleanNullField, CharNullField, ChoiceNullField,
                             VerbatimField, DeprecatedCredentialField)
 
@@ -114,7 +113,6 @@ SUMMARIZABLE_FK_FIELDS = {
     'source_project': DEFAULT_SUMMARY_FIELDS + ('status', 'scm_type'),
     'project_update': DEFAULT_SUMMARY_FIELDS + ('status', 'failed',),
     'credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'cloud', 'credential_type_id'),
-    'vault_credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'cloud', 'credential_type_id'),
     'job': DEFAULT_SUMMARY_FIELDS + ('status', 'failed', 'elapsed', 'type'),
     'job_template': DEFAULT_SUMMARY_FIELDS,
     'workflow_job_template': DEFAULT_SUMMARY_FIELDS,
@@ -133,6 +131,8 @@ SUMMARIZABLE_FK_FIELDS = {
     'notification_template': DEFAULT_SUMMARY_FIELDS,
     'instance_group': {'id', 'name', 'controller_id'},
     'insights_credential': DEFAULT_SUMMARY_FIELDS,
+    'source_credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'cloud', 'credential_type_id'),
+    'target_credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'cloud', 'credential_type_id'),
 }
 
 
@@ -143,7 +143,7 @@ def reverse_gfk(content_object, request):
     Returns a dictionary of the form
         { '<type>': reverse(<type detail>) }
     for example
-        { 'organization': '/api/v1/organizations/1/' }
+        { 'organization': '/api/v2/organizations/1/' }
     '''
     if content_object is None or not hasattr(content_object, 'get_absolute_url'):
         return {}
@@ -300,10 +300,7 @@ class BaseSerializer(serializers.ModelSerializer, metaclass=BaseSerializerMetacl
 
     @property
     def version(self):
-        """
-        The request version component of the URL as an integer i.e., 1 or 2
-        """
-        return get_request_version(self.context.get('request')) or 1
+        return 2
 
     def get_type(self, obj):
         return get_type_for_model(self.Meta.model)
@@ -358,10 +355,9 @@ class BaseSerializer(serializers.ModelSerializer, metaclass=BaseSerializerMetacl
         if view and (hasattr(view, 'retrieve') or view.request.method == 'POST') and \
                 type(obj) in settings.NAMED_URL_GRAPH:
             original_url = self.get_url(obj)
-            if not original_url.startswith('/api/v1'):
-                res['named_url'] = self._generate_named_url(
-                    original_url, obj, settings.NAMED_URL_GRAPH[type(obj)]
-                )
+            res['named_url'] = self._generate_named_url(
+                original_url, obj, settings.NAMED_URL_GRAPH[type(obj)]
+            )
         if getattr(obj, 'created_by', None):
             res['created_by'] = self.reverse('api:user_detail', kwargs={'pk': obj.created_by.pk})
         if getattr(obj, 'modified_by', None):
@@ -395,8 +391,6 @@ class BaseSerializer(serializers.ModelSerializer, metaclass=BaseSerializerMetacl
                     continue
                 summary_fields[fk] = OrderedDict()
                 for field in related_fields:
-                    if self.version < 2 and field == 'credential_type_id':  # TODO: remove version check in 3.3
-                        continue
 
                     fval = getattr(fkval, field, None)
 
@@ -641,18 +635,6 @@ class EmptySerializer(serializers.Serializer):
     pass
 
 
-class BaseFactSerializer(BaseSerializer, metaclass=BaseSerializerMetaclass):
-
-    def get_fields(self):
-        ret = super(BaseFactSerializer, self).get_fields()
-        if 'module' in ret:
-            # TODO: the values_list may pull in a LOT of entries before the distinct is called
-            modules = Fact.objects.all().values_list('module', flat=True).distinct()
-            choices = [(o, o.title()) for o in modules]
-            ret['module'] = serializers.ChoiceField(choices=choices, read_only=True, required=False)
-        return ret
-
-
 class UnifiedJobTemplateSerializer(BaseSerializer):
     # As a base serializer, the capabilities prefetch is not used directly
     _capabilities_prefetch = [
@@ -895,16 +877,16 @@ class UserSerializer(BaseSerializer):
                   'username', 'first_name', 'last_name',
                   'email', 'is_superuser', 'is_system_auditor', 'password', 'ldap_dn', 'last_login', 'external_account')
 
-    def to_representation(self, obj):  # TODO: Remove in 3.3
+    def to_representation(self, obj):
         ret = super(UserSerializer, self).to_representation(obj)
         ret.pop('password', None)
-        if obj and type(self) is UserSerializer or self.version == 1:
+        if obj and type(self) is UserSerializer:
             ret['auth'] = obj.social_auth.values('provider', 'uid')
         return ret
 
     def get_validation_exclusions(self, obj=None):
         ret = super(UserSerializer, self).get_validation_exclusions(obj)
-        ret.append('password')
+        ret.extend(['password', 'is_system_auditor'])
         return ret
 
     def validate_password(self, value):
@@ -915,7 +897,7 @@ class UserSerializer(BaseSerializer):
     def _update_password(self, obj, new_password):
         # For now we're not raising an error, just not saving password for
         # users managed by LDAP who already have an unusable password set.
-        if getattr(settings, 'AUTH_LDAP_SERVER_URI', None) and feature_enabled('ldap'):
+        if getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
             try:
                 if obj.pk and obj.profile.ldap_dn and not obj.has_usable_password():
                     new_password = None
@@ -933,8 +915,12 @@ class UserSerializer(BaseSerializer):
         if new_password:
             obj.set_password(new_password)
             obj.save(update_fields=['password'])
-            if self.context['request'].user != obj:
-                UserSessionMembership.clear_session_for_user(obj)
+
+            # Cycle the session key, but if the requesting user is the same
+            # as the modified user then inject a session key derived from
+            # the updated user to prevent logout. This is the logic used by
+            # the Django admin's own user_change_password view.
+            update_session_auth_hash(self.context['request'], obj)
         elif not obj.password:
             obj.set_unusable_password()
             obj.save(update_fields=['password'])
@@ -944,14 +930,20 @@ class UserSerializer(BaseSerializer):
 
     def create(self, validated_data):
         new_password = validated_data.pop('password', None)
+        is_system_auditor = validated_data.pop('is_system_auditor', None)
         obj = super(UserSerializer, self).create(validated_data)
         self._update_password(obj, new_password)
+        if is_system_auditor is not None:
+            obj.is_system_auditor = is_system_auditor
         return obj
 
     def update(self, obj, validated_data):
         new_password = validated_data.pop('password', None)
+        is_system_auditor = validated_data.pop('is_system_auditor', None)
         obj = super(UserSerializer, self).update(obj, validated_data)
         self._update_password(obj, new_password)
+        if is_system_auditor is not None:
+            obj.is_system_auditor = is_system_auditor
         return obj
 
     def get_related(self, obj):
@@ -972,7 +964,7 @@ class UserSerializer(BaseSerializer):
         return res
 
     def _validate_ldap_managed_field(self, value, field_name):
-        if not getattr(settings, 'AUTH_LDAP_SERVER_URI', None) or not feature_enabled('ldap'):
+        if not getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
             return value
         try:
             is_ldap_user = bool(self.instance and self.instance.profile.ldap_dn)
@@ -1001,6 +993,16 @@ class UserSerializer(BaseSerializer):
 
     def validate_is_superuser(self, value):
         return self._validate_ldap_managed_field(value, 'is_superuser')
+
+
+class UserActivityStreamSerializer(UserSerializer):
+    """Changes to system auditor status are shown as separate entries,
+    so by excluding it from fields here we avoid duplication, which
+    would carry some unintended consequences.
+    """
+    class Meta:
+        model = User
+        fields = ('*', '-is_system_auditor')
 
 
 class BaseOAuth2TokenSerializer(BaseSerializer):
@@ -1066,7 +1068,7 @@ class BaseOAuth2TokenSerializer(BaseSerializer):
             if word not in self.ALLOWED_SCOPES:
                 return False
         return True
-            
+
     def validate_scope(self, value):
         if not self._is_valid_scope(value):
             raise serializers.ValidationError(_(
@@ -1082,7 +1084,7 @@ class BaseOAuth2TokenSerializer(BaseSerializer):
             raise PermissionDenied(str(e))
 
 
-class UserAuthorizedTokenSerializer(BaseOAuth2TokenSerializer):  
+class UserAuthorizedTokenSerializer(BaseOAuth2TokenSerializer):
 
     class Meta:
         extra_kwargs = {
@@ -1099,7 +1101,7 @@ class UserAuthorizedTokenSerializer(BaseOAuth2TokenSerializer):
         )
         obj = super(UserAuthorizedTokenSerializer, self).create(validated_data)
         obj.save()
-        if obj.application and obj.application.authorization_grant_type != 'implicit':
+        if obj.application:
             RefreshToken.objects.create(
                 user=current_user,
                 token=generate_token(),
@@ -1121,7 +1123,7 @@ class OAuth2TokenSerializer(BaseOAuth2TokenSerializer):
         if obj.application and obj.application.user:
             obj.user = obj.application.user
         obj.save()
-        if obj.application and obj.application.authorization_grant_type != 'implicit':
+        if obj.application:
             RefreshToken.objects.create(
                 user=current_user,
                 token=generate_token(),
@@ -1134,7 +1136,7 @@ class OAuth2TokenSerializer(BaseOAuth2TokenSerializer):
 class OAuth2TokenDetailSerializer(OAuth2TokenSerializer):
 
     class Meta:
-        read_only_fields = ('*', 'user', 'application')       
+        read_only_fields = ('*', 'user', 'application')
 
 
 class UserPersonalTokenSerializer(BaseOAuth2TokenSerializer):
@@ -1154,9 +1156,9 @@ class UserPersonalTokenSerializer(BaseOAuth2TokenSerializer):
 
 
 class OAuth2ApplicationSerializer(BaseSerializer):
-    
+
     show_capabilities = ['edit', 'delete']
-    
+
     class Meta:
         model = OAuth2Application
         fields = (
@@ -1181,8 +1183,8 @@ class OAuth2ApplicationSerializer(BaseSerializer):
             'skip_authorization': {
                 'label': _('Skip Authorization')
             },
-        }        
-        
+        }
+
     def to_representation(self, obj):
         ret = super(OAuth2ApplicationSerializer, self).to_representation(obj)
         request = self.context.get('request', None)
@@ -1191,7 +1193,7 @@ class OAuth2ApplicationSerializer(BaseSerializer):
         if obj.client_type == 'public':
             ret.pop('client_secret', None)
         return ret
-        
+
     def get_related(self, obj):
         res = super(OAuth2ApplicationSerializer, self).get_related(obj)
         res.update(dict(
@@ -1244,7 +1246,7 @@ class OrganizationSerializer(BaseSerializer):
             applications    = self.reverse('api:organization_applications_list',     kwargs={'pk': obj.pk}),
             activity_stream = self.reverse('api:organization_activity_stream_list', kwargs={'pk': obj.pk}),
             notification_templates = self.reverse('api:organization_notification_templates_list', kwargs={'pk': obj.pk}),
-            notification_templates_any = self.reverse('api:organization_notification_templates_any_list', kwargs={'pk': obj.pk}),
+            notification_templates_started = self.reverse('api:organization_notification_templates_started_list', kwargs={'pk': obj.pk}),
             notification_templates_success = self.reverse('api:organization_notification_templates_success_list', kwargs={'pk': obj.pk}),
             notification_templates_error = self.reverse('api:organization_notification_templates_error_list', kwargs={'pk': obj.pk}),
             object_roles = self.reverse('api:organization_object_roles_list', kwargs={'pk': obj.pk}),
@@ -1350,14 +1352,14 @@ class ProjectSerializer(UnifiedJobTemplateSerializer, ProjectOptionsSerializer):
             scm_inventory_sources = self.reverse('api:project_scm_inventory_sources', kwargs={'pk': obj.pk}),
             schedules = self.reverse('api:project_schedules_list', kwargs={'pk': obj.pk}),
             activity_stream = self.reverse('api:project_activity_stream_list', kwargs={'pk': obj.pk}),
-            notification_templates_any = self.reverse('api:project_notification_templates_any_list', kwargs={'pk': obj.pk}),
+            notification_templates_started = self.reverse('api:project_notification_templates_started_list', kwargs={'pk': obj.pk}),
             notification_templates_success = self.reverse('api:project_notification_templates_success_list', kwargs={'pk': obj.pk}),
             notification_templates_error = self.reverse('api:project_notification_templates_error_list', kwargs={'pk': obj.pk}),
             access_list = self.reverse('api:project_access_list', kwargs={'pk': obj.pk}),
             object_roles = self.reverse('api:project_object_roles_list', kwargs={'pk': obj.pk}),
+            copy = self.reverse('api:project_copy', kwargs={'pk': obj.pk})
+
         ))
-        if self.version > 1:
-            res['copy'] = self.reverse('api:project_copy', kwargs={'pk': obj.pk})
         if obj.organization:
             res['organization'] = self.reverse('api:organization_detail',
                                                kwargs={'pk': obj.organization.pk})
@@ -1552,9 +1554,8 @@ class InventorySerializer(BaseSerializerWithVariables):
             access_list = self.reverse('api:inventory_access_list',         kwargs={'pk': obj.pk}),
             object_roles = self.reverse('api:inventory_object_roles_list', kwargs={'pk': obj.pk}),
             instance_groups = self.reverse('api:inventory_instance_groups_list', kwargs={'pk': obj.pk}),
+            copy = self.reverse('api:inventory_copy', kwargs={'pk': obj.pk})
         ))
-        if self.version > 1:
-            res['copy'] = self.reverse('api:inventory_copy', kwargs={'pk': obj.pk})
         if obj.insights_credential:
             res['insights_credential'] = self.reverse('api:credential_detail', kwargs={'pk': obj.insights_credential.pk})
         if obj.organization:
@@ -1606,20 +1607,6 @@ class InventorySerializer(BaseSerializerWithVariables):
         return super(InventorySerializer, self).validate(attrs)
 
 
-# TODO: Remove entire serializer in 3.3, replace with normal serializer
-class InventoryDetailSerializer(InventorySerializer):
-
-    def get_fields(self):
-        fields = super(InventoryDetailSerializer, self).get_fields()
-        if self.version == 1:
-            fields['can_run_ad_hoc_commands'] = serializers.SerializerMethodField()
-        return fields
-
-    def get_can_run_ad_hoc_commands(self, obj):
-        view = self.context.get('view', None)
-        return bool(obj and view and view.request and view.request.user and view.request.user.can_access(Inventory, 'run_ad_hoc_commands', obj))
-
-
 class InventoryScriptSerializer(InventorySerializer):
 
     class Meta:
@@ -1659,20 +1646,15 @@ class HostSerializer(BaseSerializerWithVariables):
             smart_inventories = self.reverse('api:host_smart_inventories_list', kwargs={'pk': obj.pk}),
             ad_hoc_commands = self.reverse('api:host_ad_hoc_commands_list', kwargs={'pk': obj.pk}),
             ad_hoc_command_events = self.reverse('api:host_ad_hoc_command_events_list', kwargs={'pk': obj.pk}),
-            fact_versions = self.reverse('api:host_fact_versions_list', kwargs={'pk': obj.pk}),
+            insights = self.reverse('api:host_insights', kwargs={'pk': obj.pk}),
+            ansible_facts = self.reverse('api:host_ansible_facts_detail', kwargs={'pk': obj.pk}),
         ))
-        if self.version > 1:
-            res['insights'] = self.reverse('api:host_insights', kwargs={'pk': obj.pk})
         if obj.inventory:
             res['inventory'] = self.reverse('api:inventory_detail', kwargs={'pk': obj.inventory.pk})
         if obj.last_job:
             res['last_job'] = self.reverse('api:job_detail', kwargs={'pk': obj.last_job.pk})
         if obj.last_job_host_summary:
             res['last_job_host_summary'] = self.reverse('api:job_host_summary_detail', kwargs={'pk': obj.last_job_host_summary.pk})
-        if self.version > 1:
-            res.update(dict(
-                ansible_facts = self.reverse('api:host_ansible_facts_detail', kwargs={'pk': obj.pk}),
-            ))
         return res
 
     def get_summary_fields(self, obj):
@@ -1758,6 +1740,7 @@ class AnsibleFactsSerializer(BaseSerializer):
 
 
 class GroupSerializer(BaseSerializerWithVariables):
+    show_capabilities = ['copy', 'edit', 'delete']
     capabilities_prefetch = ['inventory.admin', 'inventory.adhoc']
     groups_with_active_failures = serializers.IntegerField(
         read_only=True,
@@ -1771,13 +1754,6 @@ class GroupSerializer(BaseSerializerWithVariables):
                   'total_hosts', 'hosts_with_active_failures', 'total_groups',
                   'groups_with_active_failures', 'has_inventory_sources')
 
-    @property
-    def show_capabilities(self):  # TODO: consolidate in 3.3
-        if self.version == 1:
-            return ['copy', 'edit', 'start', 'schedule', 'delete']
-        else:
-            return ['copy', 'edit', 'delete']
-
     def build_relational_field(self, field_name, relation_info):
         field_class, field_kwargs = super(GroupSerializer, self).build_relational_field(field_name, relation_info)
         # Inventory is read-only unless creating a new group.
@@ -1785,20 +1761,6 @@ class GroupSerializer(BaseSerializerWithVariables):
             field_kwargs['read_only'] = True
             field_kwargs.pop('queryset', None)
         return field_class, field_kwargs
-
-    def get_summary_fields(self, obj):  # TODO: remove in 3.3
-        summary_fields = super(GroupSerializer, self).get_summary_fields(obj)
-        if self.version == 1:
-            try:
-                inv_src = obj.deprecated_inventory_source
-                summary_fields['inventory_source'] = {}
-                for field in SUMMARIZABLE_FK_FIELDS['inventory_source']:
-                    fval = getattr(inv_src, field, None)
-                    if fval is not None:
-                        summary_fields['inventory_source'][field] = fval
-            except Group.deprecated_inventory_source.RelatedObjectDoesNotExist:
-                pass
-        return summary_fields
 
     def get_related(self, obj):
         res = super(GroupSerializer, self).get_related(obj)
@@ -1814,23 +1776,9 @@ class GroupSerializer(BaseSerializerWithVariables):
             inventory_sources = self.reverse('api:group_inventory_sources_list', kwargs={'pk': obj.pk}),
             ad_hoc_commands = self.reverse('api:group_ad_hoc_commands_list', kwargs={'pk': obj.pk}),
         ))
-        if self.version == 1:  # TODO: remove in 3.3
-            try:
-                res['inventory_source'] = self.reverse('api:inventory_source_detail',
-                                                       kwargs={'pk': obj.deprecated_inventory_source.pk})
-            except Group.deprecated_inventory_source.RelatedObjectDoesNotExist:
-                pass
         if obj.inventory:
             res['inventory'] = self.reverse('api:inventory_detail', kwargs={'pk': obj.inventory.pk})
         return res
-
-    def create(self, validated_data):  # TODO: remove in 3.3
-        instance = super(GroupSerializer, self).create(validated_data)
-        if self.version == 1:  # TODO: remove in 3.3
-            manual_src = InventorySource(deprecated_group=instance, inventory=instance.inventory)
-            manual_src.v1_group_name = instance.name
-            manual_src.save()
-        return instance
 
     def validate_name(self, value):
         if value in ('all', '_meta'):
@@ -1933,9 +1881,8 @@ class CustomInventoryScriptSerializer(BaseSerializer):
         res = super(CustomInventoryScriptSerializer, self).get_related(obj)
         res.update(dict(
             object_roles = self.reverse('api:inventory_script_object_roles_list', kwargs={'pk': obj.pk}),
+            copy = self.reverse('api:inventory_script_copy', kwargs={'pk': obj.pk}),
         ))
-        if self.version > 1:
-            res['copy'] = self.reverse('api:inventory_script_copy', kwargs={'pk': obj.pk})
 
         if obj.organization:
             res['organization'] = self.reverse('api:organization_detail', kwargs={'pk': obj.organization.pk})
@@ -1950,7 +1897,7 @@ class InventorySourceOptionsSerializer(BaseSerializer):
     class Meta:
         fields = ('*', 'source', 'source_path', 'source_script', 'source_vars', 'credential',
                   'source_regions', 'instance_filters', 'group_by', 'overwrite', 'overwrite_vars',
-                  'timeout', 'verbosity')
+                  'custom_virtualenv', 'timeout', 'verbosity')
 
     def get_related(self, obj):
         res = super(InventorySourceOptionsSerializer, self).get_related(obj)
@@ -1996,22 +1943,6 @@ class InventorySourceOptionsSerializer(BaseSerializer):
 
         return super(InventorySourceOptionsSerializer, self).validate(attrs)
 
-    # TODO: remove when old 'credential' fields are removed
-    def get_summary_fields(self, obj):
-        summary_fields = super(InventorySourceOptionsSerializer, self).get_summary_fields(obj)
-        if 'credential' in summary_fields:
-            cred = obj.get_cloud_credential()
-            if cred:
-                summary_fields['credential'] = {
-                    'id': cred.id, 'name': cred.name, 'description': cred.description,
-                    'kind': cred.kind, 'cloud': True
-                }
-                if self.version > 1:
-                    summary_fields['credential']['credential_type_id'] = cred.credential_type_id
-            else:
-                summary_fields.pop('credential')
-        return summary_fields
-
 
 class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOptionsSerializer):
 
@@ -2023,14 +1954,12 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
         {'admin': 'inventory.admin'},
         {'start': 'inventory.update'}
     ]
-    group = serializers.SerializerMethodField(
-        help_text=_('Automatic group relationship, will be removed in 3.3'))
 
     class Meta:
         model = InventorySource
         fields = ('*', 'name', 'inventory', 'update_on_launch', 'update_cache_timeout',
                   'source_project', 'update_on_project_update') + \
-                 ('last_update_failed', 'last_updated', 'group') # Backwards compatibility.
+                 ('last_update_failed', 'last_updated') # Backwards compatibility.
 
     def get_related(self, obj):
         res = super(InventorySourceSerializer, self).get_related(obj)
@@ -2041,7 +1970,7 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
             activity_stream = self.reverse('api:inventory_source_activity_stream_list', kwargs={'pk': obj.pk}),
             hosts = self.reverse('api:inventory_source_hosts_list', kwargs={'pk': obj.pk}),
             groups = self.reverse('api:inventory_source_groups_list', kwargs={'pk': obj.pk}),
-            notification_templates_any = self.reverse('api:inventory_source_notification_templates_any_list', kwargs={'pk': obj.pk}),
+            notification_templates_started = self.reverse('api:inventory_source_notification_templates_started_list', kwargs={'pk': obj.pk}),
             notification_templates_success = self.reverse('api:inventory_source_notification_templates_success_list', kwargs={'pk': obj.pk}),
             notification_templates_error = self.reverse('api:inventory_source_notification_templates_error_list', kwargs={'pk': obj.pk}),
         ))
@@ -2056,29 +1985,9 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
         if obj.last_update:
             res['last_update'] = self.reverse('api:inventory_update_detail',
                                               kwargs={'pk': obj.last_update.pk})
-        if self.version == 1:  # TODO: remove in 3.3
-            if obj.deprecated_group:
-                res['group'] = self.reverse('api:group_detail', kwargs={'pk': obj.deprecated_group.pk})
         else:
             res['credentials'] = self.reverse('api:inventory_source_credentials_list', kwargs={'pk': obj.pk})
         return res
-
-    def get_fields(self):  # TODO: remove in 3.3
-        fields = super(InventorySourceSerializer, self).get_fields()
-        if self.version > 1:
-            fields.pop('group', None)
-        return fields
-
-    def get_summary_fields(self, obj):  # TODO: remove in 3.3
-        summary_fields = super(InventorySourceSerializer, self).get_summary_fields(obj)
-        if self.version == 1 and obj.deprecated_group_id:
-            g = obj.deprecated_group
-            summary_fields['group'] = {}
-            for field in SUMMARIZABLE_FK_FIELDS['group']:
-                fval = getattr(g, field, None)
-                if fval is not None:
-                    summary_fields['group'][field] = fval
-        return summary_fields
 
     def get_group(self, obj):  # TODO: remove in 3.3
         if obj.deprecated_group:
@@ -2112,12 +2021,6 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
     def validate_source_project(self, value):
         if value and value.scm_type == '':
             raise serializers.ValidationError(_("Cannot use manual project for SCM-based inventory."))
-        return value
-
-    def validate_source(self, value):
-        if value == '':
-            raise serializers.ValidationError(_(
-                "Manual inventory sources are created automatically when a group is created in the v1 API."))
         return value
 
     def validate_update_on_project_update(self, value):
@@ -2240,8 +2143,7 @@ class InventoryUpdateSerializer(UnifiedJobSerializer, InventorySourceOptionsSeri
         if obj.inventory:
             res['inventory'] = self.reverse('api:inventory_detail', kwargs={'pk': obj.inventory.pk})
 
-        if self.version > 1:
-            res['credentials'] = self.reverse('api:inventory_update_credentials_list', kwargs={'pk': obj.pk})
+        res['credentials'] = self.reverse('api:inventory_update_credentials_list', kwargs={'pk': obj.pk})
 
         return res
 
@@ -2273,14 +2175,25 @@ class InventoryUpdateDetailSerializer(InventoryUpdateSerializer):
 
     def get_summary_fields(self, obj):
         summary_fields = super(InventoryUpdateDetailSerializer, self).get_summary_fields(obj)
-        summary_obj = self.get_source_project(obj)
 
-        if summary_obj:
+        source_project = self.get_source_project(obj)
+        if source_project:
             summary_fields['source_project'] = {}
             for field in SUMMARIZABLE_FK_FIELDS['project']:
-                value = getattr(summary_obj, field, None)
+                value = getattr(source_project, field, None)
                 if value is not None:
                     summary_fields['source_project'][field] = value
+
+        cred = obj.credentials.first()
+        if cred:
+            summary_fields['credential'] = {
+                'id': cred.pk,
+                'name': cred.name,
+                'description': cred.description,
+                'kind': cred.kind,
+                'cloud': cred.credential_type.kind == 'cloud'
+            }
+
         return summary_fields
 
 
@@ -2487,7 +2400,7 @@ class CredentialTypeSerializer(BaseSerializer):
 
     class Meta:
         model = CredentialType
-        fields = ('*', 'kind', 'name', 'managed_by_tower', 'inputs',
+        fields = ('*', 'kind', 'namespace', 'name', 'managed_by_tower', 'inputs',
                   'injectors')
 
     def validate(self, attrs):
@@ -2549,66 +2462,21 @@ class CredentialTypeSerializer(BaseSerializer):
         return fields
 
 
-# TODO: remove when API v1 is removed
-class V1CredentialFields(BaseSerializer, metaclass=BaseSerializerMetaclass):
+class CredentialSerializer(BaseSerializer):
+    show_capabilities = ['edit', 'delete', 'copy', 'use']
+    capabilities_prefetch = ['admin', 'use']
 
     class Meta:
         model = Credential
-        fields = ('*', 'kind', 'cloud', 'host', 'username',
-                  'password', 'security_token', 'project', 'domain',
-                  'ssh_key_data', 'ssh_key_unlock', 'become_method',
-                  'become_username', 'become_password', 'vault_password',
-                  'subscription', 'tenant', 'secret', 'client', 'authorize',
-                  'authorize_password')
-
-    def build_field(self, field_name, info, model_class, nested_depth):
-        if field_name in V1Credential.FIELDS:
-            return self.build_standard_field(field_name,
-                                             V1Credential.FIELDS[field_name])
-        return super(V1CredentialFields, self).build_field(field_name, info, model_class, nested_depth)
-
-
-class V2CredentialFields(BaseSerializer, metaclass=BaseSerializerMetaclass):
-
-    class Meta:
-        model = Credential
-        fields = ('*', 'credential_type', 'inputs')
-
+        fields = ('*', 'organization', 'credential_type', 'inputs', 'kind', 'cloud')
         extra_kwargs = {
             'credential_type': {
                 'label': _('Credential Type'),
             },
         }
 
-
-class CredentialSerializer(BaseSerializer):
-    show_capabilities = ['edit', 'delete', 'copy']
-    capabilities_prefetch = ['admin', 'use']
-
-    class Meta:
-        model = Credential
-        fields = ('*', 'organization')
-
-    def get_fields(self):
-        fields = super(CredentialSerializer, self).get_fields()
-
-        # TODO: remove when API v1 is removed
-        if self.version == 1:
-            fields.update(V1CredentialFields().get_fields())
-        else:
-            fields.update(V2CredentialFields().get_fields())
-        return fields
-
     def to_representation(self, data):
         value = super(CredentialSerializer, self).to_representation(data)
-
-        # TODO: remove when API v1 is removed
-        if self.version == 1:
-            if value.get('kind') == 'vault':
-                value['kind'] = 'ssh'
-            for field in V1Credential.PASSWORD_FIELDS:
-                if field in value and force_text(value[field]).startswith('$encrypted$'):
-                    value[field] = '$encrypted$'
 
         if 'inputs' in value:
             value['inputs'] = data.display_inputs()
@@ -2626,15 +2494,10 @@ class CredentialSerializer(BaseSerializer):
             object_roles = self.reverse('api:credential_object_roles_list', kwargs={'pk': obj.pk}),
             owner_users = self.reverse('api:credential_owner_users_list', kwargs={'pk': obj.pk}),
             owner_teams = self.reverse('api:credential_owner_teams_list', kwargs={'pk': obj.pk}),
+            copy = self.reverse('api:credential_copy', kwargs={'pk': obj.pk}),
+            input_sources = self.reverse('api:credential_input_source_sublist', kwargs={'pk': obj.pk}),
+            credential_type = self.reverse('api:credential_type_detail', kwargs={'pk': obj.credential_type.pk}),
         ))
-        if self.version > 1:
-            res['copy'] = self.reverse('api:credential_copy', kwargs={'pk': obj.pk})
-
-        # TODO: remove when API v1 is removed
-        if self.version > 1:
-            res.update(dict(
-                credential_type = self.reverse('api:credential_type_detail', kwargs={'pk': obj.credential_type.pk}),
-            ))
 
         parents = [role for role in obj.admin_role.parents.all() if role.object_id is not None]
         if parents:
@@ -2670,53 +2533,11 @@ class CredentialSerializer(BaseSerializer):
         return summary_dict
 
     def get_validation_exclusions(self, obj=None):
-        # CredentialType is now part of validation; legacy v1 fields (e.g.,
-        # 'username', 'password') in JSON POST payloads use the
-        # CredentialType's inputs definition to determine their validity
         ret = super(CredentialSerializer, self).get_validation_exclusions(obj)
         for field in ('credential_type', 'inputs'):
             if field in ret:
                 ret.remove(field)
         return ret
-
-    def to_internal_value(self, data):
-        # TODO: remove when API v1 is removed
-        if 'credential_type' not in data and self.version == 1:
-            # If `credential_type` is not provided, assume the payload is a
-            # v1 credential payload that specifies a `kind` and a flat list
-            # of field values
-            #
-            # In this scenario, we should automatically detect the proper
-            # CredentialType based on the provided values
-            kind = data.get('kind', 'ssh')
-            credential_type = CredentialType.from_v1_kind(kind, data)
-            if credential_type is None:
-                raise serializers.ValidationError({"kind": _('"%s" is not a valid choice' % kind)})
-            data['credential_type'] = credential_type.pk
-            value = OrderedDict(
-                list({'credential_type': credential_type}.items()) +
-                list(super(CredentialSerializer, self).to_internal_value(data).items())
-            )
-
-            # Make a set of the keys in the POST/PUT payload
-            # - Subtract real fields (name, organization, inputs)
-            # - Subtract virtual v1 fields defined on the determined credential
-            #   type (username, password, etc...)
-            # - Any leftovers are invalid for the determined credential type
-            valid_fields = set(super(CredentialSerializer, self).get_fields().keys())
-            valid_fields.update(V2CredentialFields().get_fields().keys())
-            valid_fields.update(['kind', 'cloud'])
-
-            for field in set(data.keys()) - valid_fields - set(credential_type.defined_fields):
-                if data.get(field):
-                    raise serializers.ValidationError(
-                        {"detail": _("'{field_name}' is not a valid field for {credential_type_name}").format(
-                            field_name=field, credential_type_name=credential_type.name
-                        )}
-                    )
-            value.pop('kind', None)
-            return value
-        return super(CredentialSerializer, self).to_internal_value(data)
 
     def validate_credential_type(self, credential_type):
         if self.instance and credential_type.pk != self.instance.credential_type.pk:
@@ -2774,35 +2595,12 @@ class CredentialSerializerCreate(CredentialSerializer):
         if attrs.get('team'):
             attrs['organization'] = attrs['team'].organization
 
-        try:
-            return super(CredentialSerializerCreate, self).validate(attrs)
-        except ValidationError as e:
-            # TODO: remove when API v1 is removed
-            # If we have an `inputs` error on `/api/v1/`:
-            # {'inputs': {'username': [...]}}
-            # ...instead, send back:
-            # {'username': [...]}
-            if self.version == 1 and isinstance(e.detail.get('inputs'), dict):
-                e.detail = e.detail['inputs']
-                raise e
-            else:
-                raise
+        return super(CredentialSerializerCreate, self).validate(attrs)
 
     def create(self, validated_data):
         user = validated_data.pop('user', None)
         team = validated_data.pop('team', None)
 
-        # If our payload contains v1 credential fields, translate to the new
-        # model
-        # TODO: remove when API v1 is removed
-        if self.version == 1:
-            for attr in (
-                set(V1Credential.FIELDS) & set(validated_data.keys())  # set intersection
-            ):
-                validated_data.setdefault('inputs', {})
-                value = validated_data.pop(attr)
-                if value:
-                    validated_data['inputs'][attr] = value
         credential = super(CredentialSerializerCreate, self).create(validated_data)
 
         if user:
@@ -2813,6 +2611,32 @@ class CredentialSerializerCreate(CredentialSerializer):
             credential.admin_role.parents.add(team.admin_role)
             credential.use_role.parents.add(team.member_role)
         return credential
+
+
+class CredentialInputSourceSerializer(BaseSerializer):
+    show_capabilities = ['delete']
+
+    class Meta:
+        model = CredentialInputSource
+        fields = (
+            '*',
+            'input_field_name',
+            'metadata',
+            'target_credential',
+            'source_credential',
+            '-name',
+        )
+        extra_kwargs = {
+            'input_field_name': {'required': True},
+            'target_credential': {'required': True},
+            'source_credential': {'required': True},
+        }
+
+    def get_related(self, obj):
+        res = super(CredentialInputSourceSerializer, self).get_related(obj)
+        res['source_credential'] = obj.source_credential.get_absolute_url(request=self.context.get('request'))
+        res['target_credential'] = obj.target_credential.get_absolute_url(request=self.context.get('request'))
+        return res
 
 
 class UserCredentialSerializerCreate(CredentialSerializerCreate):
@@ -2855,35 +2679,6 @@ class LabelsListMixin(object):
         return res
 
 
-# TODO: remove when API v1 is removed
-class V1JobOptionsSerializer(BaseSerializer, metaclass=BaseSerializerMetaclass):
-
-    class Meta:
-        model = Credential
-        fields = ('*', 'cloud_credential', 'network_credential')
-
-    V1_FIELDS = ('cloud_credential', 'network_credential',)
-
-    def build_field(self, field_name, info, model_class, nested_depth):
-        if field_name in self.V1_FIELDS:
-            return (DeprecatedCredentialField, {})
-        return super(V1JobOptionsSerializer, self).build_field(field_name, info, model_class, nested_depth)
-
-
-class LegacyCredentialFields(BaseSerializer, metaclass=BaseSerializerMetaclass):
-
-    class Meta:
-        model = Credential
-        fields = ('*', 'credential', 'vault_credential')
-
-    LEGACY_FIELDS = ('credential', 'vault_credential',)
-
-    def build_field(self, field_name, info, model_class, nested_depth):
-        if field_name in self.LEGACY_FIELDS:
-            return (DeprecatedCredentialField, {})
-        return super(LegacyCredentialFields, self).build_field(field_name, info, model_class, nested_depth)
-
-
 class JobOptionsSerializer(LabelsListMixin, BaseSerializer):
 
     class Meta:
@@ -2891,16 +2686,6 @@ class JobOptionsSerializer(LabelsListMixin, BaseSerializer):
                   'forks', 'limit', 'verbosity', 'extra_vars', 'job_tags',
                   'force_handlers', 'skip_tags', 'start_at_task', 'timeout',
                   'use_fact_cache',)
-
-    def get_fields(self):
-        fields = super(JobOptionsSerializer, self).get_fields()
-
-        # TODO: remove when API v1 is removed
-        if self.version == 1:
-            fields.update(V1JobOptionsSerializer().get_fields())
-
-        fields.update(LegacyCredentialFields().get_fields())
-        return fields
 
     def get_related(self, obj):
         res = super(JobOptionsSerializer, self).get_related(obj)
@@ -2915,40 +2700,18 @@ class JobOptionsSerializer(LabelsListMixin, BaseSerializer):
                 res['project'] = self.reverse('api:project_detail', kwargs={'pk': obj.project.pk})
         except ObjectDoesNotExist:
             setattr(obj, 'project', None)
-        try:
-            if obj.credential:
-                res['credential'] = self.reverse(
-                    'api:credential_detail', kwargs={'pk': obj.credential}
-                )
-        except ObjectDoesNotExist:
-            setattr(obj, 'credential', None)
-        try:
-            if obj.vault_credential:
-                res['vault_credential'] = self.reverse(
-                    'api:credential_detail', kwargs={'pk': obj.vault_credential}
-                )
-        except ObjectDoesNotExist:
-            setattr(obj, 'vault_credential', None)
-        if self.version > 1:
-            if isinstance(obj, UnifiedJobTemplate):
-                res['extra_credentials'] = self.reverse(
-                    'api:job_template_extra_credentials_list',
-                    kwargs={'pk': obj.pk}
-                )
-                res['credentials'] = self.reverse(
-                    'api:job_template_credentials_list',
-                    kwargs={'pk': obj.pk}
-                )
-            elif isinstance(obj, UnifiedJob):
-                res['extra_credentials'] = self.reverse('api:job_extra_credentials_list', kwargs={'pk': obj.pk})
-                res['credentials'] = self.reverse('api:job_credentials_list', kwargs={'pk': obj.pk})
-        else:
-            cloud_cred = obj.cloud_credential
-            if cloud_cred:
-                res['cloud_credential'] = self.reverse('api:credential_detail', kwargs={'pk': cloud_cred})
-            net_cred = obj.network_credential
-            if net_cred:
-                res['network_credential'] = self.reverse('api:credential_detail', kwargs={'pk': net_cred})
+        if isinstance(obj, UnifiedJobTemplate):
+            res['extra_credentials'] = self.reverse(
+                'api:job_template_extra_credentials_list',
+                kwargs={'pk': obj.pk}
+            )
+            res['credentials'] = self.reverse(
+                'api:job_template_credentials_list',
+                kwargs={'pk': obj.pk}
+            )
+        elif isinstance(obj, UnifiedJob):
+            res['extra_credentials'] = self.reverse('api:job_extra_credentials_list', kwargs={'pk': obj.pk})
+            res['credentials'] = self.reverse('api:job_credentials_list', kwargs={'pk': obj.pk})
 
         return res
 
@@ -2962,70 +2725,9 @@ class JobOptionsSerializer(LabelsListMixin, BaseSerializer):
             ret['project'] = None
             if 'playbook' in ret:
                 ret['playbook'] = ''
-        ret['credential'] = obj.credential
-        ret['vault_credential'] = obj.vault_credential
-        if self.version == 1:
-            ret['cloud_credential'] = obj.cloud_credential
-            ret['network_credential'] = obj.network_credential
         return ret
 
-    def create(self, validated_data):
-        deprecated_fields = {}
-        for key in ('credential', 'vault_credential', 'cloud_credential', 'network_credential'):
-            if key in validated_data:
-                deprecated_fields[key] = validated_data.pop(key)
-        obj = super(JobOptionsSerializer, self).create(validated_data)
-        if deprecated_fields:  # TODO: remove in 3.3
-            self._update_deprecated_fields(deprecated_fields, obj)
-        return obj
-
-    def update(self, obj, validated_data):
-        deprecated_fields = {}
-        for key in ('credential', 'vault_credential', 'cloud_credential', 'network_credential'):
-            if key in validated_data:
-                deprecated_fields[key] = validated_data.pop(key)
-        obj = super(JobOptionsSerializer, self).update(obj, validated_data)
-        if deprecated_fields:  # TODO: remove in 3.3
-            self._update_deprecated_fields(deprecated_fields, obj)
-        return obj
-
-    def _update_deprecated_fields(self, fields, obj):
-        for key, existing in (
-            ('credential', obj.credentials.filter(credential_type__kind='ssh')),
-            ('vault_credential', obj.credentials.filter(credential_type__kind='vault')),
-            ('cloud_credential', obj.cloud_credentials),
-            ('network_credential', obj.network_credentials),
-        ):
-            if key in fields:
-                new_cred = fields[key]
-                if new_cred not in existing:
-                    for cred in existing:
-                        obj.credentials.remove(cred)
-                    if new_cred:
-                        obj.credentials.add(new_cred)
-
     def validate(self, attrs):
-        v1_credentials = {}
-        view = self.context.get('view', None)
-        for attr, kind, error in (
-            ('cloud_credential', 'cloud', _('You must provide a cloud credential.')),
-            ('network_credential', 'net', _('You must provide a network credential.')),
-            ('credential', 'ssh', _('You must provide an SSH credential.')),
-            ('vault_credential', 'vault', _('You must provide a vault credential.')),
-        ):
-            if kind in ('cloud', 'net') and self.version > 1:
-                continue  # cloud and net deprecated creds are v1 only
-            if attr in attrs:
-                v1_credentials[attr] = None
-                pk = attrs.pop(attr)
-                if pk:
-                    cred = v1_credentials[attr] = Credential.objects.get(pk=pk)
-                    if cred.credential_type.kind != kind:
-                        raise serializers.ValidationError({attr: error})
-                    if ((not self.instance or cred.pk != getattr(self.instance, attr)) and
-                            view and view.request and view.request.user not in cred.use_role):
-                        raise PermissionDenied()
-
         if 'project' in self.fields and 'playbook' in self.fields:
             project = attrs.get('project', self.instance and self.instance.project or None)
             playbook = attrs.get('playbook', self.instance and self.instance.playbook or '')
@@ -3039,7 +2741,6 @@ class JobOptionsSerializer(LabelsListMixin, BaseSerializer):
                 raise serializers.ValidationError({'playbook': _('Must select playbook for project.')})
 
         ret = super(JobOptionsSerializer, self).validate(attrs)
-        ret.update(v1_credentials)
         return ret
 
 
@@ -3065,12 +2766,6 @@ class JobTemplateMixin(object):
         if obj.survey_spec is not None and ('name' in obj.survey_spec and 'description' in obj.survey_spec):
             d['survey'] = dict(title=obj.survey_spec['name'], description=obj.survey_spec['description'])
         d['recent_jobs'] = self._recent_jobs(obj)
-
-        # TODO: remove in 3.3
-        if self.version == 1 and 'vault_credential' in d:
-            if d['vault_credential'].get('kind','') == 'vault':
-                d['vault_credential']['kind'] = 'ssh'
-
         return d
 
 
@@ -3097,7 +2792,7 @@ class JobTemplateSerializer(JobTemplateMixin, UnifiedJobTemplateSerializer, JobO
             schedules = self.reverse('api:job_template_schedules_list', kwargs={'pk': obj.pk}),
             activity_stream = self.reverse('api:job_template_activity_stream_list', kwargs={'pk': obj.pk}),
             launch = self.reverse('api:job_template_launch', kwargs={'pk': obj.pk}),
-            notification_templates_any = self.reverse('api:job_template_notification_templates_any_list', kwargs={'pk': obj.pk}),
+            notification_templates_started = self.reverse('api:job_template_notification_templates_started_list', kwargs={'pk': obj.pk}),
             notification_templates_success = self.reverse('api:job_template_notification_templates_success_list', kwargs={'pk': obj.pk}),
             notification_templates_error = self.reverse('api:job_template_notification_templates_error_list', kwargs={'pk': obj.pk}),
             access_list = self.reverse('api:job_template_access_list',      kwargs={'pk': obj.pk}),
@@ -3106,9 +2801,8 @@ class JobTemplateSerializer(JobTemplateMixin, UnifiedJobTemplateSerializer, JobO
             object_roles = self.reverse('api:job_template_object_roles_list', kwargs={'pk': obj.pk}),
             instance_groups = self.reverse('api:job_template_instance_groups_list', kwargs={'pk': obj.pk}),
             slice_workflow_jobs = self.reverse('api:job_template_slice_workflow_jobs_list', kwargs={'pk': obj.pk}),
+            copy = self.reverse('api:job_template_copy', kwargs={'pk': obj.pk}),
         ))
-        if self.version > 1:
-            res['copy'] = self.reverse('api:job_template_copy', kwargs={'pk': obj.pk})
         if obj.host_config_key:
             res['callback'] = self.reverse('api:job_template_callback', kwargs={'pk': obj.pk})
         return res
@@ -3136,20 +2830,11 @@ class JobTemplateSerializer(JobTemplateMixin, UnifiedJobTemplateSerializer, JobO
     def validate_extra_vars(self, value):
         return vars_validate_or_raise(value)
 
-    def validate_job_slice_count(self, value):
-        if value > 1 and not feature_enabled('workflows'):
-            raise LicenseForbids({'job_slice_count': [_(
-                "Job slicing is a workflows-based feature and your license does not allow use of workflows."
-            )]})
-        return value
 
     def get_summary_fields(self, obj):
         summary_fields = super(JobTemplateSerializer, self).get_summary_fields(obj)
         all_creds = []
         # Organize credential data into multitude of deprecated fields
-        # TODO: remove most of this as v1 is removed
-        vault_credential = None
-        credential = None
         extra_creds = []
         if obj.pk:
             for cred in obj.credentials.all():
@@ -3160,30 +2845,12 @@ class JobTemplateSerializer(JobTemplateMixin, UnifiedJobTemplateSerializer, JobO
                     'kind': cred.kind,
                     'cloud': cred.credential_type.kind == 'cloud'
                 }
-                if self.version > 1:
-                    summarized_cred['credential_type_id'] = cred.credential_type_id
                 all_creds.append(summarized_cred)
                 if cred.credential_type.kind in ('cloud', 'net'):
                     extra_creds.append(summarized_cred)
-                elif summarized_cred['kind'] == 'ssh':
-                    credential = summarized_cred
-                elif summarized_cred['kind'] == 'vault':
-                    vault_credential = summarized_cred
-        # Selectively apply those fields, depending on view deetails
-        if (self.is_detail_view or self.version == 1) and credential:
-            summary_fields['credential'] = credential
-        else:
-            # Credential could be an empty dictionary in this case
-            summary_fields.pop('credential', None)
-        if (self.is_detail_view or self.version == 1) and vault_credential:
-            summary_fields['vault_credential'] = vault_credential
-        else:
-            # vault credential could be empty dictionary
-            summary_fields.pop('vault_credential', None)
-        if self.version > 1:
-            if self.is_detail_view:
-                summary_fields['extra_credentials'] = extra_creds
-            summary_fields['credentials'] = all_creds
+        if self.is_detail_view:
+            summary_fields['extra_credentials'] = extra_creds
+        summary_fields['credentials'] = all_creds
         return summary_fields
 
 
@@ -3200,41 +2867,12 @@ class JobTemplateWithSpecSerializer(JobTemplateSerializer):
 class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
 
     passwords_needed_to_start = serializers.ReadOnlyField()
-    ask_diff_mode_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_variables_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_limit_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_skip_tags_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_tags_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_job_type_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_verbosity_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_inventory_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
-    ask_credential_on_launch = serializers.BooleanField(
-        read_only=True,
-        help_text=_('This field has been deprecated and will be removed in a future release'))
     artifacts = serializers.SerializerMethodField()
 
     class Meta:
         model = Job
-        fields = ('*', 'job_template', 'passwords_needed_to_start', 'ask_diff_mode_on_launch',
-                  'ask_variables_on_launch', 'ask_limit_on_launch', 'ask_tags_on_launch', 'ask_skip_tags_on_launch',
-                  'ask_job_type_on_launch', 'ask_verbosity_on_launch', 'ask_inventory_on_launch',
-                  'ask_credential_on_launch', 'allow_simultaneous', 'artifacts', 'scm_revision',
+        fields = ('*', 'job_template', 'passwords_needed_to_start',
+                  'allow_simultaneous', 'artifacts', 'scm_revision',
                   'instance_group', 'diff_mode', 'job_slice_number', 'job_slice_count')
 
     def get_related(self, obj):
@@ -3245,6 +2883,7 @@ class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
             activity_stream = self.reverse('api:job_activity_stream_list', kwargs={'pk': obj.pk}),
             notifications = self.reverse('api:job_notifications_list', kwargs={'pk': obj.pk}),
             labels = self.reverse('api:job_label_list', kwargs={'pk': obj.pk}),
+            create_schedule = self.reverse('api:job_create_schedule', kwargs={'pk': obj.pk}),
         ))
         try:
             if obj.job_template:
@@ -3252,8 +2891,6 @@ class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
                                                    kwargs={'pk': obj.job_template.pk})
         except ObjectDoesNotExist:
             setattr(obj, 'job_template', None)
-        if (obj.can_start or True) and self.version == 1:  # TODO: remove in 3.3
-            res['start'] = self.reverse('api:job_start', kwargs={'pk': obj.pk})
         if obj.can_cancel or True:
             res['cancel'] = self.reverse('api:job_cancel', kwargs={'pk': obj.pk})
         try:
@@ -3263,8 +2900,6 @@ class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
                 )
         except ObjectDoesNotExist:
             pass
-        if self.version > 1:
-            res['create_schedule'] = self.reverse('api:job_create_schedule', kwargs={'pk': obj.pk})
         res['relaunch'] = self.reverse('api:job_relaunch', kwargs={'pk': obj.pk})
         return res
 
@@ -3272,34 +2907,6 @@ class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
         if obj:
             return obj.display_artifacts()
         return {}
-
-    def to_internal_value(self, data):
-        # When creating a new job and a job template is specified, populate any
-        # fields not provided in data from the job template.
-        if not self.instance and isinstance(data, dict) and data.get('job_template', False):
-            try:
-                job_template = JobTemplate.objects.get(pk=data['job_template'])
-            except JobTemplate.DoesNotExist:
-                raise serializers.ValidationError({'job_template': _('Invalid job template.')})
-            data.setdefault('name', job_template.name)
-            data.setdefault('description', job_template.description)
-            data.setdefault('job_type', job_template.job_type)
-            if job_template.inventory:
-                data.setdefault('inventory', job_template.inventory.pk)
-            if job_template.project:
-                data.setdefault('project', job_template.project.pk)
-                data.setdefault('playbook', job_template.playbook)
-            if job_template.credential:
-                data.setdefault('credential', job_template.credential)
-            data.setdefault('forks', job_template.forks)
-            data.setdefault('limit', job_template.limit)
-            data.setdefault('verbosity', job_template.verbosity)
-            data.setdefault('extra_vars', job_template.extra_vars)
-            data.setdefault('job_tags', job_template.job_tags)
-            data.setdefault('force_handlers', job_template.force_handlers)
-            data.setdefault('skip_tags', job_template.skip_tags)
-            data.setdefault('start_at_task', job_template.start_at_task)
-        return super(JobSerializer, self).to_internal_value(data)
 
     def to_representation(self, obj):
         ret = super(JobSerializer, self).to_representation(obj)
@@ -3315,9 +2922,6 @@ class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
         summary_fields = super(JobSerializer, self).get_summary_fields(obj)
         all_creds = []
         # Organize credential data into multitude of deprecated fields
-        # TODO: remove most of this as v1 is removed
-        vault_credential = None
-        credential = None
         extra_creds = []
         if obj.pk:
             for cred in obj.credentials.all():
@@ -3328,30 +2932,12 @@ class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
                     'kind': cred.kind,
                     'cloud': cred.credential_type.kind == 'cloud'
                 }
-                if self.version > 1:
-                    summarized_cred['credential_type_id'] = cred.credential_type_id
                 all_creds.append(summarized_cred)
                 if cred.credential_type.kind in ('cloud', 'net'):
                     extra_creds.append(summarized_cred)
-                elif summarized_cred['kind'] == 'ssh':
-                    credential = summarized_cred
-                elif summarized_cred['kind'] == 'vault':
-                    vault_credential = summarized_cred
-        # Selectively apply those fields, depending on view deetails
-        if (self.is_detail_view or self.version == 1) and credential:
-            summary_fields['credential'] = credential
-        else:
-            # Credential could be an empty dictionary in this case
-            summary_fields.pop('credential', None)
-        if (self.is_detail_view or self.version == 1) and vault_credential:
-            summary_fields['vault_credential'] = vault_credential
-        else:
-            # vault credential could be empty dictionary
-            summary_fields.pop('vault_credential', None)
-        if self.version > 1:
-            if self.is_detail_view:
-                summary_fields['extra_credentials'] = extra_creds
-            summary_fields['credentials'] = all_creds
+        if self.is_detail_view:
+            summary_fields['extra_credentials'] = extra_creds
+        summary_fields['credentials'] = all_creds
         return summary_fields
 
 
@@ -3618,7 +3204,7 @@ class SystemJobTemplateSerializer(UnifiedJobTemplateSerializer):
             jobs = self.reverse('api:system_job_template_jobs_list', kwargs={'pk': obj.pk}),
             schedules = self.reverse('api:system_job_template_schedules_list', kwargs={'pk': obj.pk}),
             launch = self.reverse('api:system_job_template_launch', kwargs={'pk': obj.pk}),
-            notification_templates_any = self.reverse('api:system_job_template_notification_templates_any_list', kwargs={'pk': obj.pk}),
+            notification_templates_started = self.reverse('api:system_job_template_notification_templates_started_list', kwargs={'pk': obj.pk}),
             notification_templates_success = self.reverse('api:system_job_template_notification_templates_success_list', kwargs={'pk': obj.pk}),
             notification_templates_error = self.reverse('api:system_job_template_notification_templates_error_list', kwargs={'pk': obj.pk}),
 
@@ -3685,15 +3271,14 @@ class WorkflowJobTemplateSerializer(JobTemplateMixin, LabelsListMixin, UnifiedJo
             workflow_nodes = self.reverse('api:workflow_job_template_workflow_nodes_list', kwargs={'pk': obj.pk}),
             labels = self.reverse('api:workflow_job_template_label_list', kwargs={'pk': obj.pk}),
             activity_stream = self.reverse('api:workflow_job_template_activity_stream_list', kwargs={'pk': obj.pk}),
-            notification_templates_any = self.reverse('api:workflow_job_template_notification_templates_any_list', kwargs={'pk': obj.pk}),
+            notification_templates_started = self.reverse('api:workflow_job_template_notification_templates_started_list', kwargs={'pk': obj.pk}),
             notification_templates_success = self.reverse('api:workflow_job_template_notification_templates_success_list', kwargs={'pk': obj.pk}),
             notification_templates_error = self.reverse('api:workflow_job_template_notification_templates_error_list', kwargs={'pk': obj.pk}),
             access_list = self.reverse('api:workflow_job_template_access_list', kwargs={'pk': obj.pk}),
             object_roles = self.reverse('api:workflow_job_template_object_roles_list', kwargs={'pk': obj.pk}),
             survey_spec = self.reverse('api:workflow_job_template_survey_spec', kwargs={'pk': obj.pk}),
+            copy = self.reverse('api:workflow_job_template_copy', kwargs={'pk': obj.pk}),
         ))
-        if self.version > 1:
-            res['copy'] = self.reverse('api:workflow_job_template_copy', kwargs={'pk': obj.pk})
         if obj.organization:
             res['organization'] = self.reverse('api:organization_detail',   kwargs={'pk': obj.organization.pk})
         return res
@@ -4095,8 +3680,7 @@ class JobEventSerializer(BaseSerializer):
         ))
         if obj.parent_id:
             res['parent'] = self.reverse('api:job_event_detail', kwargs={'pk': obj.parent_id})
-        if obj.children.exists():
-            res['children'] = self.reverse('api:job_event_children_list', kwargs={'pk': obj.pk})
+        res['children'] = self.reverse('api:job_event_children_list', kwargs={'pk': obj.pk})
         if obj.host_id:
             res['host'] = self.reverse('api:host_detail', kwargs={'pk': obj.host_id})
         if obj.hosts.exists():
@@ -4397,17 +3981,16 @@ class JobLaunchSerializer(BaseSerializer):
                     name=getattrd(obj, '%s.name' % field_name, None),
                     id=getattrd(obj, '%s.pk' % field_name, None))
             elif field_name == 'credentials':
-                if self.version > 1:
-                    for cred in obj.credentials.all():
-                        cred_dict = dict(
-                            id=cred.id,
-                            name=cred.name,
-                            credential_type=cred.credential_type.pk,
-                            passwords_needed=cred.passwords_needed
-                        )
-                        if cred.credential_type.managed_by_tower and 'vault_id' in cred.credential_type.defined_fields:
-                            cred_dict['vault_id'] = cred.get_input('vault_id', default=None)
-                        defaults_dict.setdefault(field_name, []).append(cred_dict)
+                for cred in obj.credentials.all():
+                    cred_dict = dict(
+                        id=cred.id,
+                        name=cred.name,
+                        credential_type=cred.credential_type.pk,
+                        passwords_needed=cred.passwords_needed
+                    )
+                    if cred.credential_type.managed_by_tower and 'vault_id' in cred.credential_type.defined_fields:
+                        cred_dict['vault_id'] = cred.get_input('vault_id', default=None)
+                    defaults_dict.setdefault(field_name, []).append(cred_dict)
             else:
                 defaults_dict[field_name] = getattr(obj, field_name)
         return defaults_dict
@@ -4580,9 +4163,8 @@ class NotificationTemplateSerializer(BaseSerializer):
         res.update(dict(
             test = self.reverse('api:notification_template_test', kwargs={'pk': obj.pk}),
             notifications = self.reverse('api:notification_template_notification_list', kwargs={'pk': obj.pk}),
+            copy = self.reverse('api:notification_template_copy', kwargs={'pk': obj.pk}),
         ))
-        if self.version > 1:
-            res['copy'] = self.reverse('api:notification_template_copy', kwargs={'pk': obj.pk})
         if obj.organization:
             res['organization'] = self.reverse('api:organization_detail', kwargs={'pk': obj.organization.pk})
         return res
@@ -4854,6 +4436,15 @@ class InstanceGroupSerializer(BaseSerializer):
         read_only=True
     )
     instances = serializers.SerializerMethodField()
+    is_controller = serializers.BooleanField(
+        help_text=_('Indicates whether instance group controls any other group'),
+        read_only=True
+    )
+    is_isolated = serializers.BooleanField(
+        help_text=_('Indicates whether instances in this group are isolated.'
+                    'Isolated groups have a designated controller group.'),
+        read_only=True
+    )
     # NOTE: help_text is duplicated from field definitions, no obvious way of
     # both defining field details here and also getting the field's help_text
     policy_instance_percentage = serializers.IntegerField(
@@ -4879,7 +4470,7 @@ class InstanceGroupSerializer(BaseSerializer):
         fields = ("id", "type", "url", "related", "name", "created", "modified",
                   "capacity", "committed_capacity", "consumed_capacity",
                   "percent_capacity_remaining", "jobs_running", "jobs_total",
-                  "instances", "controller",
+                  "instances", "controller", "is_controller", "is_isolated",
                   "policy_instance_percentage", "policy_instance_minimum", "policy_instance_list")
 
     def get_related(self, obj):
@@ -4942,7 +4533,10 @@ class InstanceGroupSerializer(BaseSerializer):
 class ActivityStreamSerializer(BaseSerializer):
 
     changes = serializers.SerializerMethodField()
-    object_association = serializers.SerializerMethodField()
+    object_association = serializers.SerializerMethodField(
+        help_text=_("When present, shows the field name of the role or relationship that changed."))
+    object_type = serializers.SerializerMethodField(
+        help_text=_("When present, shows the model on which the role or relationship was defined."))
 
     @cached_property
     def _local_summarizable_fk_fields(self):
@@ -4967,8 +4561,8 @@ class ActivityStreamSerializer(BaseSerializer):
 
     class Meta:
         model = ActivityStream
-        fields = ('*', '-name', '-description', '-created', '-modified',
-                  'timestamp', 'operation', 'changes', 'object1', 'object2', 'object_association')
+        fields = ('*', '-name', '-description', '-created', '-modified', 'timestamp', 'operation',
+                  'changes', 'object1', 'object2', 'object_association', 'action_node', 'object_type')
 
     def get_fields(self):
         ret = super(ActivityStreamSerializer, self).get_fields()
@@ -5007,6 +4601,21 @@ class ActivityStreamSerializer(BaseSerializer):
         # so instead of splitting on period we have to take after the first underscore
         try:
             return obj.object_relationship_type.split(".")[-1].split("_", 1)[1]
+        except Exception:
+            logger.debug('Failed to parse activity stream relationship type {}'.format(obj.object_relationship_type))
+            return ""
+
+    def get_object_type(self, obj):
+        if not obj.object_relationship_type:
+            return ""
+        elif obj.object_relationship_type.endswith('_role'):
+            return camelcase_to_underscore(obj.object_relationship_type.rsplit('.', 2)[-2])
+        # default case: these values look like
+        # "awx.main.models.organization.Organization_notification_templates_success"
+        # so we have to take after the last period but before the first underscore.
+        try:
+            cls = obj.object_relationship_type.rsplit('.', 1)[0]
+            return camelcase_to_underscore(cls.split('_', 1))
         except Exception:
             logger.debug('Failed to parse activity stream relationship type {}'.format(obj.object_relationship_type))
             return ""
@@ -5108,45 +4717,3 @@ class ActivityStreamSerializer(BaseSerializer):
         if obj.setting:
             summary_fields['setting'] = [obj.setting]
         return summary_fields
-
-
-class FactVersionSerializer(BaseFactSerializer):
-
-    class Meta:
-        model = Fact
-        fields = ('related', 'module', 'timestamp')
-        read_only_fields = ('*',)
-
-    def get_related(self, obj):
-        res = super(FactVersionSerializer, self).get_related(obj)
-        params = {
-            'datetime': timestamp_apiformat(obj.timestamp),
-            'module': obj.module,
-        }
-        res['fact_view'] = '%s?%s' % (
-            reverse('api:host_fact_compare_view', kwargs={'pk': obj.host.pk}, request=self.context.get('request')),
-            urllib.parse.urlencode(params)
-        )
-        return res
-
-
-class FactSerializer(BaseFactSerializer):
-
-    class Meta:
-        model = Fact
-        # TODO: Consider adding in host to the fields list ?
-        fields = ('related', 'timestamp', 'module', 'facts', 'id', 'summary_fields', 'host')
-        read_only_fields = ('*',)
-
-    def get_related(self, obj):
-        res = super(FactSerializer, self).get_related(obj)
-        res['host'] = obj.host.get_absolute_url(self.context.get('request'))
-        return res
-
-    def to_representation(self, obj):
-        ret = super(FactSerializer, self).to_representation(obj)
-        if obj is None:
-            return ret
-        if 'facts' in ret and isinstance(ret['facts'], str):
-            ret['facts'] = json.loads(ret['facts'])
-        return ret

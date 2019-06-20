@@ -12,7 +12,6 @@ import os.path
 from urllib.parse import urljoin
 import yaml
 import configparser
-import stat
 import tempfile
 from io import StringIO
 from distutils.version import LooseVersion as Version
@@ -38,6 +37,7 @@ from awx.main.fields import (
     ImplicitRoleField,
     JSONBField,
     SmartFilterField,
+    OrderedManyToManyField,
 )
 from awx.main.managers import HostManager
 from awx.main.models.base import (
@@ -59,6 +59,7 @@ from awx.main.models.notifications import (
     NotificationTemplate,
     JobNotificationMixin,
 )
+from awx.main.models.credential.injectors import _openstack_data
 from awx.main.utils import _inventory_updates, region_sorting, get_licenser
 
 
@@ -100,32 +101,38 @@ class Inventory(CommonModelNameNotUnique, ResourceMixin, RelatedJobsMixin):
     has_active_failures = models.BooleanField(
         default=False,
         editable=False,
-        help_text=_('Flag indicating whether any hosts in this inventory have failed.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Flag indicating whether any hosts in this inventory have failed.'),
     )
     total_hosts = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Total number of hosts in this inventory.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Total number of hosts in this inventory.'),
     )
     hosts_with_active_failures = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Number of hosts in this inventory with active failures.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Number of hosts in this inventory with active failures.'),
     )
     total_groups = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Total number of groups in this inventory.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Total number of groups in this inventory.'),
     )
     groups_with_active_failures = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Number of groups in this inventory with active failures.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Number of groups in this inventory with active failures.'),
     )
     has_inventory_sources = models.BooleanField(
         default=False,
         editable=False,
-        help_text=_('Flag indicating whether this inventory has any external inventory sources.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Flag indicating whether this inventory has any external inventory sources.'),
     )
     total_inventory_sources = models.PositiveIntegerField(
         default=0,
@@ -150,9 +157,10 @@ class Inventory(CommonModelNameNotUnique, ResourceMixin, RelatedJobsMixin):
         default=None,
         help_text=_('Filter that will be applied to the hosts of this inventory.'),
     )
-    instance_groups = models.ManyToManyField(
+    instance_groups = OrderedManyToManyField(
         'InstanceGroup',
         blank=True,
+        through='InventoryInstanceGroupMembership',
     )
     admin_role = ImplicitRoleField(
         parent_role='organization.inventory_admin_role',
@@ -256,7 +264,7 @@ class Inventory(CommonModelNameNotUnique, ResourceMixin, RelatedJobsMixin):
         if towervars:
             fetch_fields.append('enabled')
         hosts = self.hosts.filter(**hosts_kw).order_by('name').only(*fetch_fields)
-        if slice_count > 1:
+        if slice_count > 1 and slice_number > 0:
             offset = slice_number - 1
             hosts = hosts[offset::slice_count]
 
@@ -625,12 +633,14 @@ class Host(CommonModelNameNotUnique, RelatedJobsMixin):
     has_active_failures  = models.BooleanField(
         default=False,
         editable=False,
-        help_text=_('Flag indicating whether the last job failed for this host.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Flag indicating whether the last job failed for this host.'),
     )
     has_inventory_sources = models.BooleanField(
         default=False,
         editable=False,
-        help_text=_('Flag indicating whether this host was created/updated from any external inventory sources.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Flag indicating whether this host was created/updated from any external inventory sources.'),
     )
     inventory_sources = models.ManyToManyField(
         'InventorySource',
@@ -800,32 +810,38 @@ class Group(CommonModelNameNotUnique, RelatedJobsMixin):
     total_hosts = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Total number of hosts directly or indirectly in this group.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Total number of hosts directly or indirectly in this group.'),
     )
     has_active_failures = models.BooleanField(
         default=False,
         editable=False,
-        help_text=_('Flag indicating whether this group has any hosts with active failures.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Flag indicating whether this group has any hosts with active failures.'),
     )
     hosts_with_active_failures = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Number of hosts in this group with active failures.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Number of hosts in this group with active failures.'),
     )
     total_groups = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Total number of child groups contained within this group.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Total number of child groups contained within this group.'),
     )
     groups_with_active_failures = models.PositiveIntegerField(
         default=0,
         editable=False,
-        help_text=_('Number of child groups within this group that have active failures.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Number of child groups within this group that have active failures.'),
     )
     has_inventory_sources = models.BooleanField(
         default=False,
         editable=False,
-        help_text=_('Flag indicating whether this group was created/updated from any external inventory sources.'),
+        help_text=_('This field is deprecated and will be removed in a future release. '
+                    'Flag indicating whether this group was created/updated from any external inventory sources.'),
     )
     inventory_sources = models.ManyToManyField(
         'InventorySource',
@@ -1429,12 +1445,13 @@ class InventorySourceOptions(BaseModel):
             return ''
 
 
-class InventorySource(UnifiedJobTemplate, InventorySourceOptions, RelatedJobsMixin):
+class InventorySource(UnifiedJobTemplate, InventorySourceOptions, CustomVirtualEnvMixin, RelatedJobsMixin):
 
     SOFT_UNIQUE_TOGETHER = [('polymorphic_ctype', 'name', 'inventory')]
 
     class Meta:
         app_label = 'main'
+        ordering = ('inventory', 'name')
 
     inventory = models.ForeignKey(
         'Inventory',
@@ -1602,20 +1619,20 @@ class InventorySource(UnifiedJobTemplate, InventorySourceOptions, RelatedJobsMix
         base_notification_templates = NotificationTemplate.objects
         error_notification_templates = list(base_notification_templates
                                             .filter(unifiedjobtemplate_notification_templates_for_errors__in=[self]))
+        started_notification_templates = list(base_notification_templates
+                                              .filter(unifiedjobtemplate_notification_templates_for_started__in=[self]))
         success_notification_templates = list(base_notification_templates
                                               .filter(unifiedjobtemplate_notification_templates_for_success__in=[self]))
-        any_notification_templates = list(base_notification_templates
-                                          .filter(unifiedjobtemplate_notification_templates_for_any__in=[self]))
         if self.inventory.organization is not None:
             error_notification_templates = set(error_notification_templates + list(base_notification_templates
                                                .filter(organization_notification_templates_for_errors=self.inventory.organization)))
+            started_notification_templates = set(started_notification_templates + list(base_notification_templates
+                                                 .filter(organization_notification_templates_for_started=self.inventory.organization)))
             success_notification_templates = set(success_notification_templates + list(base_notification_templates
                                                  .filter(organization_notification_templates_for_success=self.inventory.organization)))
-            any_notification_templates = set(any_notification_templates + list(base_notification_templates
-                                             .filter(organization_notification_templates_for_any=self.inventory.organization)))
         return dict(error=list(error_notification_templates),
-                    success=list(success_notification_templates),
-                    any=list(any_notification_templates))
+                    started=list(started_notification_templates),
+                    success=list(success_notification_templates))
 
     def clean_source(self):  # TODO: remove in 3.3
         source = self.source
@@ -1664,6 +1681,7 @@ class InventoryUpdate(UnifiedJob, InventorySourceOptions, JobNotificationMixin, 
 
     class Meta:
         app_label = 'main'
+        ordering = ('inventory', 'name')
 
     inventory = models.ForeignKey(
         'Inventory',
@@ -1776,14 +1794,12 @@ class InventoryUpdate(UnifiedJob, InventorySourceOptions, JobNotificationMixin, 
 
     @property
     def ansible_virtualenv_path(self):
+        if self.inventory_source and self.inventory_source.custom_virtualenv:
+            return self.inventory_source.custom_virtualenv
         if self.inventory_source and self.inventory_source.source_project:
             project = self.inventory_source.source_project
             if project and project.custom_virtualenv:
                 return project.custom_virtualenv
-        if self.inventory_source and self.inventory_source.inventory:
-            organization = self.inventory_source.inventory.organization
-            if organization and organization.custom_virtualenv:
-                return organization.custom_virtualenv
         return settings.ANSIBLE_VENV_PATH
 
     def cancel(self, job_explanation=None, is_chain=False):
@@ -1886,6 +1902,8 @@ class PluginFileInjector(object):
         else:
             injector_env = self.get_script_env(inventory_update, private_data_dir, private_data_files)
         env.update(injector_env)
+        # Preserves current behavior for Ansible change in default planned for 2.10
+        env['ANSIBLE_TRANSFORM_INVALID_GROUP_CHARS'] = 'never'
         return env
 
     def _get_shared_env(self, inventory_update, private_data_dir, private_data_files):
@@ -1897,13 +1915,14 @@ class PluginFileInjector(object):
         # some sources may have no credential, specifically ec2
         if credential is None:
             return injected_env
+        if self.base_injector in ('managed', 'template'):
+            injected_env['INVENTORY_UPDATE_ID'] = str(inventory_update.pk)  # so injector knows this is inventory
         if self.base_injector == 'managed':
             from awx.main.models.credential import injectors as builtin_injectors
             cred_kind = inventory_update.source.replace('ec2', 'aws')
             if cred_kind in dir(builtin_injectors):
                 getattr(builtin_injectors, cred_kind)(credential, injected_env, private_data_dir)
         elif self.base_injector == 'template':
-            injected_env['INVENTORY_UPDATE_ID'] = str(inventory_update.pk)  # so injector knows this is inventory
             safe_env = injected_env.copy()
             args = []
             credential.credential_type.inject_credential(
@@ -1948,7 +1967,7 @@ class PluginFileInjector(object):
         if cp.sections():
             f = StringIO()
             cp.write(f)
-            private_data = private_data = {'credentials': {}}
+            private_data = {'credentials': {}}
             private_data['credentials'][credential] = f.getvalue()
             return private_data
         else:
@@ -1957,8 +1976,7 @@ class PluginFileInjector(object):
 
 class azure_rm(PluginFileInjector):
     plugin_name = 'azure_rm'
-    # FIXME: https://github.com/ansible/ansible/issues/54065 need resolving to enable
-    # initial_version = '2.8'  # Driven by unsafe group names issue, hostvars
+    initial_version = '2.8'  # Driven by unsafe group names issue, hostvars, host names
     ini_env_reference = 'AZURE_INI_PATH'
     base_injector = 'managed'
 
@@ -2001,7 +2019,9 @@ class azure_rm(PluginFileInjector):
         # TODO: add proper support for group_by non-specific to compatibility
         # Dashes were not configurable in azure_rm.py script, we do not want unicode, so always use this
         ret['use_contrib_script_compatible_sanitization'] = True
-        # By default the script did not filter hosts 
+        # use same host names as script
+        ret['plain_host_names'] = True
+        # By default the script did not filter hosts
         ret['default_host_filters'] = []
         # User-given host filters
         user_filters = []
@@ -2307,21 +2327,18 @@ class ec2(PluginFileInjector):
 class gce(PluginFileInjector):
     plugin_name = 'gcp_compute'
     initial_version = '2.8'  # Driven by unsafe group names issue, hostvars
+    ini_env_reference = 'GCE_INI_PATH'
     base_injector = 'managed'
 
     def get_script_env(self, inventory_update, private_data_dir, private_data_files):
         env = super(gce, self).get_script_env(inventory_update, private_data_dir, private_data_files)
+        cred = inventory_update.get_cloud_credential()
+        # these environment keys are unique to the script operation, and are not
+        # concepts in the modern inventory plugin or gce Ansible module
+        # email and project are redundant with the creds file
+        env['GCE_EMAIL'] = cred.get_input('username', default='')
+        env['GCE_PROJECT'] = cred.get_input('project', default='')
         env['GCE_ZONE'] = inventory_update.source_regions if inventory_update.source_regions != 'all' else ''  # noqa
-
-        # by default, the GCE inventory source caches results on disk for
-        # 5 minutes; disable this behavior
-        cp = configparser.ConfigParser()
-        cp.add_section('cache')
-        cp.set('cache', 'cache_max_age', '0')
-        handle, path = tempfile.mkstemp(dir=private_data_dir)
-        cp.write(os.fdopen(handle, 'w'))
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-        env['GCE_INI_PATH'] = path
         return env
 
     def _compat_compose_vars(self):
@@ -2339,6 +2356,8 @@ class gce(PluginFileInjector):
             'gce_tags': 'tags.get("items", [])',
             'gce_zone': 'zone',
             'gce_metadata': 'metadata.get("items", []) | items2dict(key_name="key", value_name="value")',
+            # NOTE: image hostvar is enabled via retrieve_image_info option
+            'gce_image': 'image',
             # We need this as long as hostnames is non-default, otherwise hosts
             # will not be addressed correctly, was returned in script
             'ansible_ssh_host': 'networkInterfaces[0].accessConfigs[0].natIP'
@@ -2349,8 +2368,6 @@ class gce(PluginFileInjector):
         credential = inventory_update.get_cloud_credential()
 
         # auth related items
-        from awx.main.models.credential.injectors import gce as builtin_injector
-        ret['service_account_file'] = builtin_injector(credential, {}, private_data_dir)
         ret['projects'] = [credential.get_input('project', default='')]
         ret['auth_kind'] = "serviceaccount"
 
@@ -2367,7 +2384,9 @@ class gce(PluginFileInjector):
             {'prefix': '', 'separator': '', 'key': 'machineType'},
             {'prefix': '', 'separator': '', 'key': 'zone'},
             {'prefix': 'tag', 'key': 'gce_tags'},  # composed var
-            {'prefix': 'status', 'key': 'status | lower'}
+            {'prefix': 'status', 'key': 'status | lower'},
+            # NOTE: image hostvar is enabled via retrieve_image_info option
+            {'prefix': '', 'separator': '', 'key': 'image'},
         ]
         # This will be used as the gce instance_id, must be universal, non-compat
         compose_dict = {'gce_id': 'id'}
@@ -2376,6 +2395,8 @@ class gce(PluginFileInjector):
         # TODO: proper group_by and instance_filters support, irrelevant of compat mode
         # The gce.py script never sanitized any names in any way
         ret['use_contrib_script_compatible_sanitization'] = True
+        # Perform extra API query to get the image hostvar
+        ret['retrieve_image_info'] = True
         # Add in old hostvars aliases
         compose_dict.update(self._compat_compose_vars())
         # Non-default names to match script
@@ -2392,10 +2413,13 @@ class gce(PluginFileInjector):
             ret['zones'] = inventory_update.source_regions.split(',')
         return ret
 
-    def get_plugin_env(self, inventory_update, private_data_dir, private_data_files):
-        # gce wants everything defined in inventory & cred files
-        # this explicitly turns off injection of environment variables
-        return {}
+    def build_script_private_data(self, inventory_update, private_data_dir):
+        cp = configparser.RawConfigParser()
+        # by default, the GCE inventory source caches results on disk for
+        # 5 minutes; disable this behavior
+        cp.add_section('cache')
+        cp.set('cache', 'cache_max_age', '0')
+        return self.dump_cp(cp, inventory_update.get_cloud_credential())
 
 
 class vmware(PluginFileInjector):
@@ -2442,25 +2466,10 @@ class openstack(PluginFileInjector):
     def script_name(self):
         return 'openstack_inventory.py'  # exception
 
-    def _get_clouds_dict(self, inventory_update, credential, private_data_dir, mk_cache=True):
-        openstack_auth = dict(auth_url=credential.get_input('host', default=''),
-                              username=credential.get_input('username', default=''),
-                              password=credential.get_input('password', default=''),
-                              project_name=credential.get_input('project', default=''))
-        if credential.has_input('domain'):
-            openstack_auth['domain_name'] = credential.get_input('domain', default='')
+    def _get_clouds_dict(self, inventory_update, cred, private_data_dir, mk_cache=True):
+        openstack_data = _openstack_data(cred)
 
-        private_state = inventory_update.source_vars_dict.get('private', True)
-        verify_state = credential.get_input('verify_ssl', default=True)
-        openstack_data = {
-            'clouds': {
-                'devstack': {
-                    'private': private_state,
-                    'verify': verify_state,
-                    'auth': openstack_auth,
-                },
-            },
-        }
+        openstack_data['clouds']['devstack']['private'] = inventory_update.source_vars_dict.get('private', True)
         if mk_cache:
             # Retrieve cache path from inventory update vars if available,
             # otherwise create a temporary cache path only for this update.
@@ -2487,26 +2496,25 @@ class openstack(PluginFileInjector):
             openstack_data['ansible'] = ansible_variables
         return openstack_data
 
-    def build_script_private_data(self, inventory_update, private_data_dir):
+    def build_script_private_data(self, inventory_update, private_data_dir, mk_cache=True):
         credential = inventory_update.get_cloud_credential()
         private_data = {'credentials': {}}
 
-        openstack_data = self._get_clouds_dict(inventory_update, credential, private_data_dir)
+        openstack_data = self._get_clouds_dict(inventory_update, credential, private_data_dir, mk_cache=mk_cache)
         private_data['credentials'][credential] = yaml.safe_dump(
             openstack_data, default_flow_style=False, allow_unicode=True
         )
         return private_data
 
+    def build_plugin_private_data(self, inventory_update, private_data_dir):
+        # Credentials can be passed in the same way as the script did
+        # but do not create the tmp cache file
+        return self.build_script_private_data(inventory_update, private_data_dir, mk_cache=False)
+
+    def get_plugin_env(self, inventory_update, private_data_dir, private_data_files):
+        return self.get_script_env(inventory_update, private_data_dir, private_data_files)
+
     def inventory_as_dict(self, inventory_update, private_data_dir):
-        credential = inventory_update.get_cloud_credential()
-
-        openstack_data = self._get_clouds_dict(inventory_update, credential, private_data_dir, mk_cache=False)
-        handle, path = tempfile.mkstemp(dir=private_data_dir)
-        f = os.fdopen(handle, 'w')
-        yaml.dump(openstack_data, f, default_flow_style=False)
-        f.close()
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-
         def use_host_name_for_name(a_bool_maybe):
             if not isinstance(a_bool_maybe, bool):
                 # Could be specified by user via "host" or "uuid"
@@ -2521,7 +2529,6 @@ class openstack(PluginFileInjector):
             fail_on_errors=True,
             expand_hostvars=True,
             inventory_hostname=use_host_name_for_name(False),
-            clouds_yaml_path=[path]  # why a list? it just is
         )
         # Note: mucking with defaults will break import integrity
         # For the plugin, we need to use the same defaults as the old script

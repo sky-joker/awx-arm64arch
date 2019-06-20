@@ -8,18 +8,25 @@ export default ['$state', '$scope', 'ParseVariableString', 'ParseTypeChange',
     'GetChoices', 'GetBasePath', 'CreateSelect2', 'GetSourceTypeOptions',
     'SourcesService', 'inventoryData', 'inventorySourcesOptions', 'Empty',
     'Wait', 'Rest', 'Alert', '$rootScope', 'i18n', 'InventoryHostsStrings',
-    'ProcessErrors', 'inventorySource', 'isNotificationAdmin',
+    'ProcessErrors', 'inventorySource', 'isNotificationAdmin', 'ConfigData',
     function($state, $scope, ParseVariableString, ParseTypeChange,
         GetChoices, GetBasePath, CreateSelect2, GetSourceTypeOptions,
         SourcesService, inventoryData, inventorySourcesOptions, Empty,
         Wait, Rest, Alert, $rootScope, i18n, InventoryHostsStrings,
-        ProcessErrors, inventorySource, isNotificationAdmin) {
+        ProcessErrors, inventorySource, isNotificationAdmin, ConfigData) {
 
         const inventorySourceData = inventorySource.get();
 
+        // To toggle notifications a user needs to have a read role on the inventory
+        // _and_ have at least a notification template admin role on an org.
+        // If the user has gotten this far it's safe to say they have
+        // at least read access to the inventory
+        $scope.sufficientRoleForNotifToggle = isNotificationAdmin;
+        $scope.sufficientRoleForNotif =  isNotificationAdmin || $scope.user_is_system_auditor;
         $scope.projectBasePath = GetBasePath('projects') + '?not__status=never updated';
         $scope.canAdd = inventorySourcesOptions.actions.POST;
-        $scope.isNotificationAdmin = isNotificationAdmin || false;
+        const virtualEnvs = ConfigData.custom_virtualenvs || [];
+        $scope.custom_virtualenvs_options = virtualEnvs;
         // instantiate expected $scope values from inventorySourceData
         _.assign($scope,
             {credential: inventorySourceData.credential},
@@ -82,6 +89,7 @@ export default ['$state', '$scope', 'ParseVariableString', 'ParseTypeChange',
                     field_id: varName,
                     variable: varName,
                     parse_variable: 'envParseType',
+                    readOnly: !$scope.summary_fields.user_capabilities.edit
                 });
             }
         });
@@ -156,6 +164,12 @@ export default ['$state', '$scope', 'ParseVariableString', 'ParseTypeChange',
                 $scope.verbosity = $scope.verbosity_options[i];
             }
         }
+
+        CreateSelect2({
+            element: '#inventory_source_custom_virtualenv',
+            multiple: false,
+            opts: $scope.custom_virtualenvs_options
+        });
 
         initVerbositySelect();
 
@@ -289,25 +303,36 @@ export default ['$state', '$scope', 'ParseVariableString', 'ParseTypeChange',
         };
 
         $scope.lookupCredential = function(){
-            if($scope.source.value !== "scm" && $scope.source.value !== "custom") {
-                let kind = ($scope.source.value === "ec2") ? "aws" : $scope.source.value;
-                $state.go('.credential', {
-                    credential_search: {
-                        kind: kind,
-                        page_size: '5',
-                        page: '1'
-                    }
-                });
+            // For most source type selections, we filter for 1-1 matches to credential_type namespace.
+            let searchKey = 'credential_type__namespace';
+            let searchValue = $scope.source.value;
+
+            // SCM and custom source types are more generic in terms of the credentials they
+            // accept - any cloud or user-defined credential type can be used. We filter for
+            // these using the credential_type kind field, which categorizes all cloud and
+            // user-defined credentials as 'cloud'.
+            if ($scope.source.value === 'scm') {
+                searchKey = 'credential_type__kind';
+                searchValue = 'cloud';
             }
-            else {
-                $state.go('.credential', {
-                    credential_search: {
-                        credential_type__kind: "cloud",
-                        page_size: '5',
-                        page: '1'
-                    }
-                });
+
+            if ($scope.source.value === 'custom') {
+                searchKey = 'credential_type__kind';
+                searchValue = 'cloud';
             }
+
+            // When the selection is 'ec2' we actually want to filter for the 'aws' namespace.
+            if ($scope.source.value === 'ec2') {
+                searchValue = 'aws';
+            }
+
+            $state.go('.credential', {
+                credential_search: {
+                    [searchKey]: searchValue,
+                    page_size: '5',
+                    page: '1'
+                }
+            });
         };
 
         $scope.formCancel = function() {
@@ -329,6 +354,7 @@ export default ['$state', '$scope', 'ParseVariableString', 'ParseTypeChange',
                 update_on_launch: $scope.update_on_launch,
                 update_cache_timeout: $scope.update_cache_timeout || 0,
                 verbosity: $scope.verbosity.value,
+                custom_virtualenv: $scope.custom_virtualenv || null,
                 // comma-delimited strings
                 group_by: SourcesService.encodeGroupBy($scope.source, $scope.group_by),
                 source_regions: _.map($scope.source_regions, 'value').join(',')
@@ -370,7 +396,7 @@ export default ['$state', '$scope', 'ParseVariableString', 'ParseTypeChange',
                 $scope.credentialBasePath = GetBasePath('credentials') + '?credential_type__kind__in=cloud,network';
             }
             else{
-                $scope.credentialBasePath = (source === 'ec2') ? GetBasePath('credentials') + '?kind=aws' : GetBasePath('credentials') + (source === '' ? '' : '?kind=' + (source));
+                $scope.credentialBasePath = (source === 'ec2') ? GetBasePath('credentials') + '?credential_type__namespace=aws' : GetBasePath('credentials') + (source === '' ? '' : 'credential_type__namespace=' + (source));
             }
             if (source === 'ec2' || source === 'custom' || source === 'vmware' || source === 'openstack' || source === 'scm' || source === 'cloudforms' || source === "satellite6") {
                 $scope.envParseType = 'yaml';

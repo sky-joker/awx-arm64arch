@@ -18,15 +18,13 @@ export default [
         workflowLaunch, $transitions, WorkflowJobTemplate, Inventory, isNotificationAdmin
     ) {
 
+        // To toggle notifications a user needs to have a read role on the WFJT
+        // _and_ have at least a notification template admin role on an org.
+        // If the user has gotten this far it's safe to say they have
+        // at least read access to the WFJT
+        $scope.sufficientRoleForNotifToggle = isNotificationAdmin;
+        $scope.sufficientRoleForNotif =  isNotificationAdmin || $scope.user_is_system_auditor;
         $scope.missingTemplates = _.has(workflowLaunch, 'node_templates_missing') && workflowLaunch.node_templates_missing.length > 0 ? true : false;
-
-        $scope.$watch('workflow_job_template_obj.summary_fields.user_capabilities.edit', function(val) {
-            if (val === false) {
-                $scope.canAddWorkflowJobTemplate = false;
-            }
-        });
-
-        $scope.isNotificationAdmin = isNotificationAdmin || false;
 
         const criteriaObj = {
             from: (state) => state.name === 'templates.editWorkflowJobTemplate.workflowMaker',
@@ -285,7 +283,7 @@ export default [
 
         $scope.workflow_job_template_obj = workflowJobTemplateData;
         $scope.name = workflowJobTemplateData.name;
-        $scope.can_edit = workflowJobTemplateData.summary_fields.user_capabilities.edit;
+        $scope.can_edit = $scope.canAddOrEdit = workflowJobTemplateData.summary_fields.user_capabilities.edit;
         $scope.breadcrumb.workflow_job_template_name = $scope.name;
         let fld, i;
         for (fld in form.fields) {
@@ -311,7 +309,11 @@ export default [
                 // Parse extra_vars, converting to YAML.
                 $scope.variables = ParseVariableString(workflowJobTemplateData.extra_vars);
 
-                ParseTypeChange({ scope: $scope, field_id: 'workflow_job_template_variables' });
+                ParseTypeChange({
+                    scope: $scope,
+                    field_id: 'workflow_job_template_variables',
+                    readOnly: !workflowJobTemplateData.summary_fields.user_capabilities.edit
+                });
             }
             if (form.fields[fld].type === 'lookup' && workflowJobTemplateData.summary_fields[form.fields[fld].sourceModel]) {
                 $scope[form.fields[fld].sourceModel + '_' + form.fields[fld].sourceField] =

@@ -87,13 +87,6 @@ def adhoc_update_model_wrapper(adhoc_job):
     return fn
 
 
-@pytest.fixture
-def patch_CallbackQueueDispatcher():
-    with mock.patch('awx.main.tasks.CallbackQueueDispatcher') as m:
-        m.return_value = m
-        yield m
-
-
 def test_send_notifications_not_list():
     with pytest.raises(TypeError):
         tasks.send_notifications(None)
@@ -172,7 +165,7 @@ def test_openstack_client_config_generation(mocker, source, expected, private_da
         'ansible_virtualenv_path': '/venv/foo'
     })
     cloud_config = update.build_private_data(inventory_update, private_data_dir)
-    cloud_credential = yaml.load(
+    cloud_credential = yaml.safe_load(
         cloud_config.get('credentials')[credential]
     )
     assert cloud_credential['clouds'] == {
@@ -215,7 +208,7 @@ def test_openstack_client_config_generation_with_private_source_vars(mocker, sou
     })
     cloud_config = update.build_private_data(inventory_update, private_data_dir)
     cloud_credential = yaml.load(
-        cloud_config.get('credentials')[credential]
+        cloud_config.get('credentials')[credential], Loader=SafeLoader
     )
     assert cloud_credential['clouds'] == {
         'devstack': {
@@ -249,7 +242,7 @@ def parse_extra_vars(args):
     for chunk in args:
         if chunk.startswith('@/tmp/'):
             with open(chunk.strip('@'), 'r') as f:
-                extra_vars.update(yaml.load(f, SafeLoader))
+                extra_vars.update(yaml.load(f, Loader=SafeLoader))
     return extra_vars
 
 
@@ -265,10 +258,10 @@ class TestExtraVarSanitation(TestJobExecution):
         job.created_by = User(pk=123, username='angry-spud')
 
         task = tasks.RunJob()
-        task.build_extra_vars_file(job, private_data_dir, {})
+        task.build_extra_vars_file(job, private_data_dir)
 
         fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, SafeLoader)
+        extra_vars = yaml.load(fd, Loader=SafeLoader)
 
         # ensure that strings are marked as unsafe
         for unsafe in ['awx_job_template_name', 'tower_job_template_name',
@@ -289,10 +282,10 @@ class TestExtraVarSanitation(TestJobExecution):
         job.extra_vars = json.dumps({'msg': self.UNSAFE})
         task = tasks.RunJob()
 
-        task.build_extra_vars_file(job, private_data_dir, {})
+        task.build_extra_vars_file(job, private_data_dir)
 
         fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, SafeLoader)
+        extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == self.UNSAFE
         assert hasattr(extra_vars['msg'], '__UNSAFE__')
 
@@ -300,10 +293,10 @@ class TestExtraVarSanitation(TestJobExecution):
         job.extra_vars = json.dumps({'msg': {'a': [self.UNSAFE]}})
         task = tasks.RunJob()
 
-        task.build_extra_vars_file(job, private_data_dir, {})
+        task.build_extra_vars_file(job, private_data_dir)
 
         fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, SafeLoader)
+        extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == {'a': [self.UNSAFE]}
         assert hasattr(extra_vars['msg']['a'][0], '__UNSAFE__')
 
@@ -311,10 +304,10 @@ class TestExtraVarSanitation(TestJobExecution):
         job.job_template.extra_vars = job.extra_vars = json.dumps({'msg': self.UNSAFE})
         task = tasks.RunJob()
 
-        task.build_extra_vars_file(job, private_data_dir, {})
+        task.build_extra_vars_file(job, private_data_dir)
 
         fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, SafeLoader)
+        extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == self.UNSAFE
         assert not hasattr(extra_vars['msg'], '__UNSAFE__')
 
@@ -323,10 +316,10 @@ class TestExtraVarSanitation(TestJobExecution):
         job.job_template.extra_vars = job.extra_vars
         task = tasks.RunJob()
 
-        task.build_extra_vars_file(job, private_data_dir, {})
+        task.build_extra_vars_file(job, private_data_dir)
 
         fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, SafeLoader)
+        extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == {'a': {'b': [self.UNSAFE]}}
         assert not hasattr(extra_vars['msg']['a']['b'][0], '__UNSAFE__')
 
@@ -340,10 +333,10 @@ class TestExtraVarSanitation(TestJobExecution):
         })
         task = tasks.RunJob()
 
-        task.build_extra_vars_file(job, private_data_dir, {})
+        task.build_extra_vars_file(job, private_data_dir)
 
         fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, SafeLoader)
+        extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == 'other-value'
         assert hasattr(extra_vars['msg'], '__UNSAFE__')
 
@@ -355,10 +348,10 @@ class TestExtraVarSanitation(TestJobExecution):
         job.extra_vars = json.dumps({'msg': self.UNSAFE})
         task = tasks.RunJob()
 
-        task.build_extra_vars_file(job, private_data_dir, {})
+        task.build_extra_vars_file(job, private_data_dir)
 
         fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, SafeLoader)
+        extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == self.UNSAFE
         assert hasattr(extra_vars['msg'], '__UNSAFE__')
 
@@ -385,6 +378,7 @@ class TestGenericRun():
         job.status = 'running'
         job.cancel_flag = True
         job.websocket_emit_status = mock.Mock()
+        job.send_notification_templates = mock.Mock()
 
         task = tasks.RunJob()
         task.update_model = mock.Mock(wraps=update_model_wrapper)
@@ -399,8 +393,9 @@ class TestGenericRun():
         ]:
             assert c in task.update_model.call_args_list
 
-    def test_event_count(self, patch_CallbackQueueDispatcher):
+    def test_event_count(self):
         task = tasks.RunJob()
+        task.dispatcher = mock.MagicMock()
         task.instance = Job()
         task.event_ct = 0
         event_data = {}
@@ -408,12 +403,13 @@ class TestGenericRun():
         [task.event_handler(event_data) for i in range(20)]
         assert 20 == task.event_ct
 
-    def test_finished_callback_eof(self, patch_CallbackQueueDispatcher):
+    def test_finished_callback_eof(self):
         task = tasks.RunJob()
+        task.dispatcher = mock.MagicMock()
         task.instance = Job(pk=1, id=1)
         task.event_ct = 17
         task.finished_callback(None)
-        patch_CallbackQueueDispatcher.dispatch.assert_called_with({'event': 'EOF', 'final_counter': 17, 'job_id': 1})
+        task.dispatcher.dispatch.assert_called_with({'event': 'EOF', 'final_counter': 17, 'job_id': 1})
 
     def test_save_job_metadata(self, job, update_model_wrapper):
         class MockMe():
@@ -473,7 +469,7 @@ class TestGenericRun():
 
         task = tasks.RunJob()
         task._write_extra_vars_file = mock.Mock()
-        task.build_extra_vars_file(job, None, dict())
+        task.build_extra_vars_file(job, None)
 
         call_args, _ = task._write_extra_vars_file.call_args_list[0]
 
@@ -494,7 +490,7 @@ class TestGenericRun():
 
         task = tasks.RunJob()
         task._write_extra_vars_file = mock.Mock()
-        task.build_extra_vars_file(job, None, dict())
+        task.build_extra_vars_file(job, None)
 
         call_args, _ = task._write_extra_vars_file.call_args_list[0]
 
@@ -530,10 +526,10 @@ class TestGenericRun():
         job.project.custom_virtualenv = '/venv/missing'
         task = tasks.RunJob()
 
-        with pytest.raises(RuntimeError) as e:
+        with pytest.raises(tasks.InvalidVirtualenvError) as e:
             task.build_env(job, private_data_dir)
 
-        assert 'a valid Python virtualenv does not exist at /venv/missing' == str(e.value)
+        assert 'Invalid virtual environment selected: /venv/missing' == str(e.value)
 
 
 class TestAdhocRun(TestJobExecution):
@@ -541,6 +537,7 @@ class TestAdhocRun(TestJobExecution):
     def test_options_jinja_usage(self, adhoc_job, adhoc_update_model_wrapper):
         adhoc_job.module_args = '{{ ansible_ssh_pass }}'
         adhoc_job.websocket_emit_status = mock.Mock()
+        adhoc_job.send_notification_templates = mock.Mock()
 
         task = tasks.RunAdHocCommand()
         task.update_model = mock.Mock(wraps=adhoc_update_model_wrapper)
@@ -582,7 +579,7 @@ class TestAdhocRun(TestJobExecution):
 
         task = tasks.RunAdHocCommand()
         task._write_extra_vars_file = mock.Mock()
-        task.build_extra_vars_file(adhoc_job, None, dict())
+        task.build_extra_vars_file(adhoc_job, None)
 
         call_args, _ = task._write_extra_vars_file.call_args_list[0]
 
@@ -693,14 +690,21 @@ class TestJobCredentials(TestJobExecution):
         job.websocket_emit_status = mock.Mock()
         job._credentials = []
 
+        def _credentials_filter(credential_type__kind=None):
+            creds = job._credentials
+            if credential_type__kind:
+                creds = [c for c in creds if c.credential_type.kind == credential_type__kind]
+            return mock.Mock(
+                __iter__ = lambda *args: iter(creds),
+                first = lambda: creds[0] if len(creds) else None
+            )
+
         credentials_mock = mock.Mock(**{
             'all': lambda: job._credentials,
             'add': job._credentials.append,
-            'filter.return_value': mock.Mock(
-                __iter__ = lambda *args: iter(job._credentials),
-                first = lambda: job._credentials[0]
-            ),
-            'spec_set': ['all', 'add', 'filter']
+            'filter.side_effect': _credentials_filter,
+            'prefetch_related': lambda _: credentials_mock,
+            'spec_set': ['all', 'add', 'filter', 'prefetch_related'],
         })
 
         with mock.patch.object(UnifiedJob, 'credentials', credentials_mock):
@@ -876,7 +880,7 @@ class TestJobCredentials(TestJobExecution):
     def test_multi_vault_password(self, private_data_dir, job):
         task = tasks.RunJob()
         vault = CredentialType.defaults['vault']()
-        for i, label in enumerate(['dev', 'prod']):
+        for i, label in enumerate(['dev', 'prod', 'dotted.name']):
             credential = Credential(
                 pk=i,
                 credential_type=vault,
@@ -896,10 +900,12 @@ class TestJobCredentials(TestJobExecution):
         )
         assert vault_passwords['Vault password \(prod\):\\s*?$'] == 'pass@prod'  # noqa
         assert vault_passwords['Vault password \(dev\):\\s*?$'] == 'pass@dev'  # noqa
+        assert vault_passwords['Vault password \(dotted.name\):\\s*?$'] == 'pass@dotted.name'  # noqa
         assert vault_passwords['Vault password:\\s*?$'] == ''  # noqa
         assert '--ask-vault-pass' not in ' '.join(args)
         assert '--vault-id dev@prompt' in ' '.join(args)
         assert '--vault-id prod@prompt' in ' '.join(args)
+        assert '--vault-id dotted.name@prompt' in ' '.join(args)
 
     def test_multi_vault_id_conflict(self, job):
         task = tasks.RunJob()
@@ -1689,7 +1695,7 @@ class TestProjectUpdateCredentials(TestJobExecution):
         assert settings.PROJECTS_ROOT in process_isolation['process_isolation_show_paths']
 
         task._write_extra_vars_file = mock.Mock()
-        task.build_extra_vars_file(project_update, private_data_dir, {})
+        task.build_extra_vars_file(project_update, private_data_dir)
 
         call_args, _ = task._write_extra_vars_file.call_args_list[0]
         _, extra_vars = call_args
@@ -1839,11 +1845,11 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         inventory_update.get_cloud_credential = get_cred
         inventory_update.get_extra_credentials = mocker.Mock(return_value=[])
 
-        private_data_files = task.build_private_data_files(inventory_update, private_data_dir)
-        env = task.build_env(inventory_update, private_data_dir, False, private_data_files)
+        # force test to use the ec2 script injection logic, as opposed to plugin
+        with mocker.patch('awx.main.tasks._get_ansible_version', mocker.MagicMock(return_value='2.7')):
+            private_data_files = task.build_private_data_files(inventory_update, private_data_dir)
+            env = task.build_env(inventory_update, private_data_dir, False, private_data_files)
 
-        injector = InventorySource.injectors['ec2']('2.7')
-        env = injector.get_script_env(inventory_update, private_data_dir, private_data_files)
         safe_env = build_safe_env(env)
 
         assert env['AWS_ACCESS_KEY_ID'] == 'bob'
@@ -1915,12 +1921,11 @@ class TestInventoryUpdateCredentials(TestJobExecution):
             'group_by_resource_group': 'no'
         }
 
-        private_data_files = task.build_private_data_files(inventory_update, private_data_dir)
-        env = task.build_env(inventory_update, private_data_dir, False, private_data_files)
+        # force azure_rm inventory to use script injection logic, as opposed to plugin
+        with mocker.patch('awx.main.tasks._get_ansible_version', mocker.MagicMock(return_value='2.7')):
+            private_data_files = task.build_private_data_files(inventory_update, private_data_dir)
+            env = task.build_env(inventory_update, private_data_dir, False, private_data_files)
 
-
-        injector = InventorySource.injectors['azure_rm']('2.7')
-        env = injector.get_script_env(inventory_update, private_data_dir, private_data_files)
         safe_env = build_safe_env(env)
 
         assert env['AZURE_CLIENT_ID'] == 'some-client'
@@ -1966,12 +1971,11 @@ class TestInventoryUpdateCredentials(TestJobExecution):
             'group_by_security_group': 'no'
         }
 
-        private_data_files = task.build_private_data_files(inventory_update, private_data_dir)
-        env = task.build_env(inventory_update, private_data_dir, False, private_data_files)
+        # force azure_rm inventory to use script injection logic, as opposed to plugin
+        with mocker.patch('awx.main.tasks._get_ansible_version', mocker.MagicMock(return_value='2.7')):
+            private_data_files = task.build_private_data_files(inventory_update, private_data_dir)
+            env = task.build_env(inventory_update, private_data_dir, False, private_data_files)
 
-
-        injector = InventorySource.injectors['azure_rm']('2.7')
-        env = injector.get_script_env(inventory_update, private_data_dir, private_data_files)
         safe_env = build_safe_env(env)
 
         assert env['AZURE_SUBSCRIPTION_ID'] == 'some-subscription'
@@ -2176,10 +2180,10 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         inventory_update.get_cloud_credential = get_cred
         inventory_update.get_extra_credentials = mocker.Mock(return_value=[])
 
-        env = task.build_env(inventory_update, private_data_dir, False)
+        # force tower inventory source to use script injection logic, as opposed to plugin
+        with mocker.patch('awx.main.tasks._get_ansible_version', mocker.MagicMock(return_value='2.7')):
+            env = task.build_env(inventory_update, private_data_dir, False)
 
-        injector = InventorySource.injectors['tower']('2.7')
-        env = injector.get_script_env(inventory_update, private_data_dir, {})
         safe_env = build_safe_env(env)
 
         assert env['TOWER_HOST'] == 'https://tower.example.org'
@@ -2240,7 +2244,9 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         inventory_update.get_extra_credentials = mocker.Mock(return_value=[])
         settings.AWX_TASK_ENV = {'FOO': 'BAR'}
 
-        env = task.build_env(inventory_update, private_data_dir, False)
+        with mocker.patch('awx.main.tasks._get_ansible_version', mocker.MagicMock(return_value='2.7')):
+            private_data_files = task.build_private_data_files(inventory_update, private_data_dir)
+            env = task.build_env(inventory_update, private_data_dir, False, private_data_files)
 
         assert env['FOO'] == 'BAR'
 
@@ -2252,7 +2258,7 @@ def test_os_open_oserror():
 
 def test_fcntl_ioerror():
     with pytest.raises(OSError):
-        fcntl.flock(99999, fcntl.LOCK_EX)
+        fcntl.lockf(99999, fcntl.LOCK_EX)
 
 
 @mock.patch('os.open')
@@ -2280,8 +2286,8 @@ def test_aquire_lock_open_fail_logged(logging_getLogger, os_open):
 @mock.patch('os.open')
 @mock.patch('os.close')
 @mock.patch('logging.getLogger')
-@mock.patch('fcntl.flock')
-def test_aquire_lock_acquisition_fail_logged(fcntl_flock, logging_getLogger, os_close, os_open):
+@mock.patch('fcntl.lockf')
+def test_aquire_lock_acquisition_fail_logged(fcntl_lockf, logging_getLogger, os_close, os_open):
     err = IOError()
     err.errno = 3
     err.strerror = 'dummy message'
@@ -2295,7 +2301,7 @@ def test_aquire_lock_acquisition_fail_logged(fcntl_flock, logging_getLogger, os_
     logger = mock.Mock()
     logging_getLogger.return_value = logger
 
-    fcntl_flock.side_effect = err
+    fcntl_lockf.side_effect = err
 
     ProjectUpdate = tasks.RunProjectUpdate()
     with pytest.raises(IOError, message='dummy message'):
