@@ -1,12 +1,13 @@
 language: python
 
 env:
-  - VERSION=5.0.0
+  - VERSION=6.0.0
 
 branches:
   except:
     - 4.0.0
     - 5.0.0
+    - 6.0.0
 
 build:
   pre_ci:
