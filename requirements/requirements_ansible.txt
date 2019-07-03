@@ -83,7 +83,7 @@ ntlm-auth==1.3.0          # via requests-credssp, requests-ntlm
 oauthlib==3.0.1           # via requests-oauthlib
 openstacksdk==0.23.0
 os-service-types==1.6.0   # via keystoneauth1, openstacksdk
-ovirt-engine-sdk-python==4.2.4
+ovirt-engine-sdk-python==4.3.0
 packaging==19.0
 paramiko==2.4.2           # via azure-cli-core, ncclient
 pbr==5.2.0                # via keystoneauth1, openstacksdk, os-service-types, stevedore
@@ -122,5 +122,5 @@ wheel==0.30.0             # via azure-cli-core
 xmltodict==0.12.0         # via pywinrm
 
 # The following packages are considered to be unsafe in a requirements file:
-pip==19.1.1
-setuptools==41.0.1
+pip==9.0.1
+setuptools==36.0.1
