@@ -256,6 +256,7 @@ class TestExtraVarSanitation(TestJobExecution):
 
     def test_vars_unsafe_by_default(self, job, private_data_dir):
         job.created_by = User(pk=123, username='angry-spud')
+        job.inventory = Inventory(pk=123, name='example-inv') 
 
         task = tasks.RunJob()
         task.build_extra_vars_file(job, private_data_dir)
@@ -268,13 +269,14 @@ class TestExtraVarSanitation(TestJobExecution):
                        'awx_user_name', 'tower_job_launch_type',
                        'awx_project_revision',
                        'tower_project_revision', 'tower_user_name',
-                       'awx_job_launch_type']:
+                       'awx_job_launch_type',
+                       'awx_inventory_name', 'tower_inventory_name']:
             assert hasattr(extra_vars[unsafe], '__UNSAFE__')
 
         # ensure that non-strings are marked as safe
         for safe in ['awx_job_template_id', 'awx_job_id', 'awx_user_id',
                      'tower_user_id', 'tower_job_template_id',
-                     'tower_job_id']:
+                     'tower_job_id', 'awx_inventory_id', 'tower_inventory_id']:
             assert not hasattr(extra_vars[safe], '__UNSAFE__')
 
 
@@ -439,6 +441,7 @@ class TestGenericRun():
         settings.AWX_PROOT_HIDE_PATHS = ['/AWX_PROOT_HIDE_PATHS1', '/AWX_PROOT_HIDE_PATHS2']
         settings.ANSIBLE_VENV_PATH = '/ANSIBLE_VENV_PATH'
         settings.AWX_VENV_PATH = '/AWX_VENV_PATH'
+        settings.AWX_ANSIBLE_COLLECTIONS_PATHS = ['/AWX_COLLECTION_PATH1', '/AWX_COLLECTION_PATH2']
 
         process_isolation_params = task.build_params_process_isolation(job, private_data_dir, cwd)
         assert True is process_isolation_params['process_isolation']
@@ -448,6 +451,10 @@ class TestGenericRun():
             "The per-job private data dir should be in the list of directories the user can see."
         assert cwd in process_isolation_params['process_isolation_show_paths'], \
             "The current working directory should be in the list of directories the user can see."
+        assert '/AWX_COLLECTION_PATH1' in process_isolation_params['process_isolation_show_paths'], \
+            "AWX global collection directory 1 of 2 should get added to the list of directories the user can see."
+        assert '/AWX_COLLECTION_PATH2' in process_isolation_params['process_isolation_show_paths'], \
+            "AWX global collection directory 2 of 2 should get added to the list of directories the user can see."
 
         for p in [settings.AWX_PROOT_BASE_PATH,
                   '/etc/tower',
@@ -506,6 +513,17 @@ class TestGenericRun():
         with mock.patch('awx.main.tasks.settings.AWX_TASK_ENV', {'FOO': 'BAR'}):
             env = task.build_env(job, private_data_dir)
         assert env['FOO'] == 'BAR'
+
+    def test_awx_task_env_respects_ansible_collections_paths(self, patch_Job, private_data_dir):
+        job = Job(project=Project(), inventory=Inventory())
+
+        task = tasks.RunJob()
+        task._write_extra_vars_file = mock.Mock()
+
+        with mock.patch('awx.main.tasks.settings.AWX_ANSIBLE_COLLECTIONS_PATHS', ['/AWX_COLLECTION_PATH']):
+            with mock.patch('awx.main.tasks.settings.AWX_TASK_ENV', {'ANSIBLE_COLLECTIONS_PATHS': '/MY_COLLECTION1:/MY_COLLECTION2'}):
+                env = task.build_env(job, private_data_dir)
+        assert env['ANSIBLE_COLLECTIONS_PATHS'] == '/MY_COLLECTION1:/MY_COLLECTION2:/AWX_COLLECTION_PATH'
 
     def test_valid_custom_virtualenv(self, patch_Job, private_data_dir):
         job = Job(project=Project(), inventory=Inventory())

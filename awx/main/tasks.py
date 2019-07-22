@@ -828,8 +828,10 @@ class BaseTask(object):
                     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
                 private_data_files['credentials'][credential] = path
             for credential, data in private_data.get('certificates', {}).items():
-                name = 'credential_%d-cert.pub' % credential.pk
-                path = os.path.join(private_data_dir, name)
+                artifact_dir = os.path.join(private_data_dir, 'artifacts', str(self.instance.id))
+                if not os.path.exists(artifact_dir):
+                    os.makedirs(artifact_dir, mode=0o700)
+                path = os.path.join(artifact_dir, 'ssh_key_data-cert.pub')
                 with open(path, 'w') as f:
                     f.write(data)
                     f.close()
@@ -857,10 +859,16 @@ class BaseTask(object):
         '''
         process_isolation_params = dict()
         if self.should_use_proot(instance):
+            show_paths = self.proot_show_paths + [private_data_dir, cwd] + \
+                settings.AWX_PROOT_SHOW_PATHS
+
+            # Help the user out by including the collections path inside the bubblewrap environment
+            if getattr(settings, 'AWX_ANSIBLE_COLLECTIONS_PATHS', []):
+                show_paths.extend(settings.AWX_ANSIBLE_COLLECTIONS_PATHS)
             process_isolation_params = {
                 'process_isolation': True,
                 'process_isolation_path': settings.AWX_PROOT_BASE_PATH,
-                'process_isolation_show_paths': self.proot_show_paths + [private_data_dir, cwd] + settings.AWX_PROOT_SHOW_PATHS,
+                'process_isolation_show_paths': show_paths,
                 'process_isolation_hide_paths': [
                     settings.AWX_PROOT_BASE_PATH,
                     '/etc/tower',
@@ -934,6 +942,11 @@ class BaseTask(object):
         if self.should_use_proot(instance):
             env['PROOT_TMP_DIR'] = settings.AWX_PROOT_BASE_PATH
         env['AWX_PRIVATE_DATA_DIR'] = private_data_dir
+
+        if 'ANSIBLE_COLLECTIONS_PATHS' in env:
+            env['ANSIBLE_COLLECTIONS_PATHS'] += os.pathsep + os.pathsep.join(settings.AWX_ANSIBLE_COLLECTIONS_PATHS)
+        else:
+            env['ANSIBLE_COLLECTIONS_PATHS'] = os.pathsep.join(settings.AWX_ANSIBLE_COLLECTIONS_PATHS)
         return env
 
     def should_use_proot(self, instance):
