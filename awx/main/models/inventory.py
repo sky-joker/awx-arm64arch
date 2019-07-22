@@ -650,7 +650,7 @@ class Host(CommonModelNameNotUnique, RelatedJobsMixin):
     )
     ansible_facts = JSONBField(
         blank=True,
-        default={},
+        default=dict,
         help_text=_('Arbitrary JSON structure of most recent ansible_facts, per-host.'),
     )
     ansible_facts_modified = models.DateTimeField(
@@ -1990,6 +1990,8 @@ class azure_rm(PluginFileInjector):
         ret = super(azure_rm, self).inventory_as_dict(inventory_update, private_data_dir)
 
         source_vars = inventory_update.source_vars_dict
+
+        ret['fail_on_template_errors'] = False
 
         group_by_hostvar = {
             'location': {'prefix': '', 'separator': '', 'key': 'location'},

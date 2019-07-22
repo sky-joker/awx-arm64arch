@@ -2560,7 +2560,7 @@ class CredentialSerializer(BaseSerializer):
 
     def validate_credential_type(self, credential_type):
         if self.instance and credential_type.pk != self.instance.credential_type.pk:
-            for rel in (
+            for related_objects in (
                 'ad_hoc_commands',
                 'insights_inventories',
                 'unifiedjobs',
@@ -2569,7 +2569,7 @@ class CredentialSerializer(BaseSerializer):
                 'projectupdates',
                 'workflowjobnodes'
             ):
-                if getattr(self.instance, rel).count() > 0:
+                if getattr(self.instance, related_objects).count() > 0:
                     raise ValidationError(
                         _('You cannot change the credential type of the credential, as it may break the functionality'
                           ' of the resources using it.'),
@@ -4640,37 +4640,37 @@ class ActivityStreamSerializer(BaseSerializer):
             return ""
 
     def get_related(self, obj):
-        rel = {}
+        data = {}
         if obj.actor is not None:
-            rel['actor'] = self.reverse('api:user_detail', kwargs={'pk': obj.actor.pk})
+            data['actor'] = self.reverse('api:user_detail', kwargs={'pk': obj.actor.pk})
         for fk, __ in self._local_summarizable_fk_fields:
             if not hasattr(obj, fk):
                 continue
-            m2m_list = self._get_rel(obj, fk)
+            m2m_list = self._get_related_objects(obj, fk)
             if m2m_list:
-                rel[fk] = []
+                data[fk] = []
                 id_list = []
-                for thisItem in m2m_list:
-                    if getattr(thisItem, 'id', None) in id_list:
+                for item in m2m_list:
+                    if getattr(item, 'id', None) in id_list:
                         continue
-                    id_list.append(getattr(thisItem, 'id', None))
-                    if hasattr(thisItem, 'get_absolute_url'):
-                        rel_url = thisItem.get_absolute_url(self.context.get('request'))
+                    id_list.append(getattr(item, 'id', None))
+                    if hasattr(item, 'get_absolute_url'):
+                        url = item.get_absolute_url(self.context.get('request'))
                     else:
                         view_name = fk + '_detail'
-                        rel_url = self.reverse('api:' + view_name, kwargs={'pk': thisItem.id})
-                    rel[fk].append(rel_url)
+                        url = self.reverse('api:' + view_name, kwargs={'pk': item.id})
+                    data[fk].append(url)
 
                     if fk == 'schedule':
-                        rel['unified_job_template'] = thisItem.unified_job_template.get_absolute_url(self.context.get('request'))
+                        data['unified_job_template'] = item.unified_job_template.get_absolute_url(self.context.get('request'))
         if obj.setting and obj.setting.get('category', None):
-            rel['setting'] = self.reverse(
+            data['setting'] = self.reverse(
                 'api:setting_singleton_detail',
                 kwargs={'category_slug': obj.setting['category']}
             )
-        return rel
+        return data
 
-    def _get_rel(self, obj, fk):
+    def _get_related_objects(self, obj, fk):
         related_model = ActivityStream._meta.get_field(fk).related_model
         related_manager = getattr(obj, fk)
         if issubclass(related_model, PolymorphicModel) and hasattr(obj, '_prefetched_objects_cache'):
@@ -4680,43 +4680,34 @@ class ActivityStreamSerializer(BaseSerializer):
                 obj._prefetched_objects_cache[related_manager.prefetch_cache_name] = list(related_manager.all())
         return related_manager.all()
 
+    def _summarize_parent_ujt(self, obj, fk, summary_fields):
+        summary_keys = {'job': 'job_template',
+                        'workflow_job_template_node': 'workflow_job_template',
+                        'schedule': 'unified_job_template'}
+        if fk not in summary_keys:
+            return
+        related_obj = getattr(obj, summary_keys[fk], None)
+        item = {}
+        fields = SUMMARIZABLE_FK_FIELDS[summary_keys[fk]]
+        if related_obj is not None:
+            summary_fields[get_type_for_model(related_obj)] = []
+            for field in fields:
+                fval = getattr(related_obj, field, None)
+                if fval is not None:
+                    item[field] = fval
+            summary_fields[get_type_for_model(related_obj)].append(item)
+
     def get_summary_fields(self, obj):
         summary_fields = OrderedDict()
         for fk, related_fields in self._local_summarizable_fk_fields:
             try:
                 if not hasattr(obj, fk):
                     continue
-                m2m_list = self._get_rel(obj, fk)
+                m2m_list = self._get_related_objects(obj, fk)
                 if m2m_list:
                     summary_fields[fk] = []
                     for thisItem in m2m_list:
-                        if fk == 'job':
-                            summary_fields['job_template'] = []
-                            job_template_item = {}
-                            job_template_fields = SUMMARIZABLE_FK_FIELDS['job_template']
-                            job_template = getattr(thisItem, 'job_template', None)
-                            if job_template is not None:
-                                for field in job_template_fields:
-                                    fval = getattr(job_template, field, None)
-                                    if fval is not None:
-                                        job_template_item[field] = fval
-                                summary_fields['job_template'].append(job_template_item)
-                        if fk == 'workflow_job_template_node':
-                            summary_fields['workflow_job_template'] = []
-                            workflow_job_template_item = {}
-                            workflow_job_template_fields = SUMMARIZABLE_FK_FIELDS['workflow_job_template']
-                            workflow_job_template = getattr(thisItem, 'workflow_job_template', None)
-                            if workflow_job_template is not None:
-                                for field in workflow_job_template_fields:
-                                    fval = getattr(workflow_job_template, field, None)
-                                    if fval is not None:
-                                        workflow_job_template_item[field] = fval
-                                summary_fields['workflow_job_template'].append(workflow_job_template_item)
-                        if fk == 'schedule':
-                            unified_job_template = getattr(thisItem, 'unified_job_template', None)
-                            if unified_job_template is not None:
-                                summary_fields[get_type_for_model(unified_job_template)] = {'id': unified_job_template.id,
-                                                                                            'name': unified_job_template.name}
+                        self._summarize_parent_ujt(thisItem, fk, summary_fields)
                         thisItemDict = {}
                         for field in related_fields:
                             fval = getattr(thisItem, field, None)
